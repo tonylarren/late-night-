@@ -1,0 +1,248 @@
+{
+  "name": "Mistral OCR Cleanup",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "n-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.mistral.ai/v1/ocr",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"mistral-ocr-latest\",\n  \"document\": {\n    \"type\": \"document_url\",\n    \"document_url\": \"{{ $json.pdfUrl }}\"\n  },\n  \"include_image_base64\": false\n}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "n-ocr",
+      "name": "Mistral OCR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        20,
+        0
+      ],
+      "notes": "Entry point. Header auth: Authorization = Bearer <MISTRAL_API_KEY>"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Mistral OCR -> flat page list\nconst res = $input.first().json;\nconst pages = (res.pages || []).map((p, i) => ({\n  index: typeof p.index === 'number' ? p.index : i,\n  markdown: p.markdown || ''\n}));\nif (!pages.length) throw new Error('No pages in OCR response');\nreturn [{ json: { pages, pageCount: pages.length } }];"
+      },
+      "id": "n-flatten",
+      "name": "Flatten Pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Deterministic pre-pass: kill page numbers + repeated running headers/footers.\n// Frequency analysis. A line in the top/bottom margin appearing on >=60% of\n// pages is furniture. Cheap, safe, and removes the LLM's chance to hallucinate.\nconst { pages } = $input.first().json;\nconst N = pages.length;\nconst MARGIN = 3;\n\nconst norm = (s) => s.trim().replace(/\\d+/g, '#').replace(/\\s+/g, ' ');\nconst PAGE_NUM = /^(?:[-–—]\\s*)?\\d{1,4}(?:\\s*[-–—])?$|^page\\s*\\d+$|^\\d+\\s*\\/\\s*\\d+$|^第\\s*\\d+\\s*页$/i;\n\nconst freq = new Map();\nfor (const p of pages) {\n  const lines = p.markdown.split('\\n');\n  const margin = [...lines.slice(0, MARGIN), ...lines.slice(-MARGIN)];\n  for (const l of margin) {\n    const k = norm(l);\n    if (!k || PAGE_NUM.test(l.trim())) continue;\n    freq.set(k, (freq.get(k) || 0) + 1);\n  }\n}\n\nconst THRESH = Math.max(2, Math.ceil(N * 0.6));\nconst furniture = new Set(\n  [...freq].filter(([k, v]) => v >= THRESH && k.length <= 80).map(([k]) => k)\n);\n\nlet stripped = 0;\nconst cleanedPages = pages.map((p, pi) => {\n  const lines = p.markdown.split('\\n');\n  const kept = lines.filter((l, idx) => {\n    const t = l.trim();\n    if (!t) return true;\n    const inMargin = idx < MARGIN || idx >= lines.length - MARGIN;\n    if (!inMargin) return true;\n    if (PAGE_NUM.test(t)) { stripped++; return false; }\n    // page 1 top lines are the real title -> keep first occurrence\n    if (pi === 0 && idx < MARGIN) return true;\n    if (furniture.has(norm(t))) { stripped++; return false; }\n    return true;\n  });\n  return { index: p.index, markdown: kept.join('\\n').replace(/\\n{3,}/g, '\\n\\n') };\n});\n\nreturn [{ json: { pages: cleanedPages, furniture: [...furniture], strippedLines: stripped } }];"
+      },
+      "id": "n-strip",
+      "name": "Strip Furniture (deterministic)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Split into LLM-sized chunks. Break on blank lines, never mid-table.\n// Sized against max output tokens, not the context window: this is a filter,\n// so output length ~= input length.\nconst { pages } = $input.first().json;\nconst MAX = 6000;   // characters. lower for CJK (~1 token/char).\n\nconst doc = pages.map(p => p.markdown).join('\\n\\n');\nconst blocks = doc.split(/\\n{2,}/);\n\nconst isTable = (b) => /^\\s*\\|/.test(b);\n\n// oversized non-table blocks get a hard line-level split\nconst atoms = [];\nfor (const b of blocks) {\n  if (b.length <= MAX || isTable(b)) { atoms.push(b); continue; }\n  let buf = '';\n  for (const line of b.split('\\n')) {\n    if (buf.length + line.length + 1 > MAX) { atoms.push(buf); buf = ''; }\n    buf = buf ? buf + '\\n' + line : line;\n  }\n  if (buf) atoms.push(buf);\n}\n\nconst chunks = [];\nlet buf = '';\nfor (const a of atoms) {\n  if (buf && buf.length + a.length + 2 > MAX) { chunks.push(buf); buf = ''; }\n  buf = buf ? buf + '\\n\\n' + a : a;\n}\nif (buf) chunks.push(buf);\n\nreturn chunks.map((c, i) => ({\n  json: { chunkIndex: i, chunkTotal: chunks.length, chunk: c, chars: c.length }\n}));"
+      },
+      "id": "n-chunk",
+      "name": "Chunk",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "options": {
+          "reset": false
+        },
+        "batchSize": 1
+      },
+      "id": "n-loop",
+      "name": "Loop Over Chunks",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        900,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.chunk }}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "OCR cleanup filter. Input: one chunk raw Mistral OCR markdown. Output: same text, noise stripped. Nothing else.\n\nRULES\nFilter, not editor. No summarize, rephrase, translate, improve.\nRetained text = byte-identical to input.\nNo commentary, no preamble, no code fences.\nNo truncation. Process to last line.\nAmbiguous? KEEP. False deletion worse than leftover noise.\n\nREMOVE\nPage numbers: bare digits, \"Page 3\", \"- 12 -\", \"3/47\", 第 5 页\nRunning headers/footers: short lines repeating title / org / doc ID\nWatermarks: DRAFT, CONFIDENTIAL, COPY, 样本, scanner banners\nArtifacts: stray glyphs (| ~ ^ ¬ ° ■ ●) alone or at line edges; separator runs (--- ___ ...) not markdown\nScan furniture: \"Scanned by...\", confidence notes, caption-less ![img-0.jpeg](img-0.jpeg)\nHyphenation across linebreak: \"govern-\\nment\" -> \"government\". Latin only. Never touch CJK chars.\n\nKEEP EXACT\nBody text, original order\nMarkers: 第X条, 第X章, Article X, §, numbered/lettered clauses\nMarkdown tables, whole, pipes and alignment rows\nReal headings (document structure, not page furniture)\nBlank lines between blocks\nCJK punctuation, full-width chars\n\nEDGES\nNumber fused to body (\"...shall apply. 12 Article 5\") -> delete number only, keep both sides.\nHeader = real title on page 1 -> keep first occurrence, drop repeats.\nChunk starts/ends mid-sentence -> emit fragment as-is. Do not complete. Do not flag.\n\nOutput cleaned chunk. Nothing else."
+            }
+          ]
+        }
+      },
+      "id": "n-clean",
+      "name": "Clean Chunk",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        1140,
+        120
+      ],
+      "notes": "Plain LLM Chain, not an Agent node: no tools needed, no token-accounting quirks."
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.0-flash",
+        "options": {
+          "temperature": 0,
+          "maxOutputTokens": 8192
+        }
+      },
+      "id": "n-model",
+      "name": "Gemini Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1160,
+        320
+      ],
+      "notes": "temperature 0. maxOutputTokens must exceed chunk size, since output ~= input."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Loop is batchSize 1 and sequential, so item order == chunk order.\nconst items = $input.all();\nconst parts = items.map(i => (i.json.text ?? i.json.response ?? '').trim());\nconst cleaned = parts.join('\\n\\n').replace(/\\n{3,}/g, '\\n\\n');\nreturn [{ json: { cleaned, chunkCount: parts.length, chars: cleaned.length } }];"
+      },
+      "id": "n-join",
+      "name": "Reassemble",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        -140
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Mistral OCR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mistral OCR": {
+      "main": [
+        [
+          {
+            "node": "Flatten Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flatten Pages": {
+      "main": [
+        [
+          {
+            "node": "Strip Furniture (deterministic)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Strip Furniture (deterministic)": {
+      "main": [
+        [
+          {
+            "node": "Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Chunks": {
+      "main": [
+        [
+          {
+            "node": "Reassemble",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Clean Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Chunk": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Clean Chunk",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
