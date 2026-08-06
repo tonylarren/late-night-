@@ -1,0 +1,392 @@
+{
+  "name": "Legal & Regulatory Document Parser (Mistral OCR + family-aware) v7",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Legal & Regulatory Document Parser",
+        "formDescription": "Upload a PDF and choose its language. Returns flat {article, contenu} rows, one per paragraph.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Document (PDF)",
+              "fieldType": "file",
+              "multipleFiles": false,
+              "acceptFileTypes": ".pdf",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Language",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Chinese"
+                  },
+                  {
+                    "option": "French"
+                  },
+                  {
+                    "option": "English"
+                  },
+                  {
+                    "option": "German"
+                  },
+                  {
+                    "option": "Spanish"
+                  }
+                ]
+              },
+              "defaultValue": "Chinese",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "86c1ea52-7a37-46b2-8b32-8db5d172173a",
+      "name": "On form submission",
+      "webhookId": "fe12e312-2e69-4ad1-b34d-3bc2e072542a"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn the uploaded PDF into a base64 data URI for Mistral OCR, and carry the\n// chosen language forward so the parser node can pick the right structure family.\nconst item = $input.first();\nconst binKeys = Object.keys(item.binary || {});\nif (!binKeys.length) throw new Error('No file was uploaded in the form.');\nconst key = binKeys[0];\n\nlet b64;\ntry {\n  const buffer = await this.helpers.getBinaryDataBuffer(0, key);\n  b64 = buffer.toString('base64');\n} catch (e) {\n  b64 = item.binary[key].data; // fallback: base64 already present on the binary\n}\n\nconst language = item.json['Language'] || 'Chinese';\nconst fileName = (item.binary[key] && item.binary[key].fileName) || 'document.pdf';\n\nreturn [{ json: {\n  dataUri: 'data:application/pdf;base64,' + b64,\n  language,\n  fileName,\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "id": "7c9f63d7-d79c-4a10-86eb-6efe82014f11",
+      "name": "Prepare OCR request"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.mistral.ai/v1/ocr",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_MISTRAL_API_KEY"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'mistral-ocr-latest', document: { type: 'document_url', document_url: $json.dataUri } }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        0
+      ],
+      "id": "acc11320-a0ae-451d-9d89-5dc0ec2c2579",
+      "name": "Mistral OCR"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * legal_structure_parser.js\n * ---------------------------------------------------------------------------\n * Family-aware structural parser for Chinese (+ FR / EN / DE / ES) legal,\n * regulatory, official and technical documents.\n *\n * Strategy (the key idea):\n *   The SAME glyph means different things in different document families.\n *   \"1.\" is a 目 in a statute, a sub-point in an official document, and a\n *   clause in a national standard. \"（一）\" is a 项 in a law but an L2 heading\n *   in a circular. So we DETECT THE FAMILY FIRST, then apply that family's\n *   hierarchy ladder.\n *\n *   1. classifyFamily(md)  -> picks one of:\n *        cn_legislative | cn_gongwen | cn_standards | latin_legislative | generic\n *   2. parseStructure(md)  -> flat list of records, splitting only down to that\n *        family's natural \"record depth\"; everything deeper folds into contenu.\n *\n * Output record:\n *   { article, contenu, level, label, family, num }\n *   - article : the header (Title / Chapter / Section / Article / clause ...)\n *   - contenu : its content (paragraphs / items / definitions / sub-clauses)\n *   - level   : depth in that family's ladder (1 = top)\n *   - label   : canonical unit name (chapter / article / item / clause / L1 ...)\n *   - family  : which master system was detected\n *   - num     : the marker's number as an integer when parseable, else null\n *   - para    : paragraph index within the article (1-based)\n *   Want strictly {article, contenu}? Drop the extra keys (see n8n block).\n *\n * Two behaviours specific to Chinese text:\n *   - PARAGRAPH EXPLOSION (default): every natural paragraph (款) inside an\n *     article becomes its own row, all inheriting the same `article`.\n *     Disable with { explodeParagraphs: false } for one row per article.\n *   - STACKED DEFINITIONS (default): inside a 术语和定义 / Terms-and-definitions\n *     section, a term written on the line *after* its number is folded into the\n *     `article` (e.g. \"3.1\" + \"个人信息\" -> article \"3.1 个人信息\"), with the\n *     definition paragraph as `contenu`. Disable with { definitions: false }.\n *\n * Options: { family?, maxDepth?, explodeParagraphs?, definitions?,\n *            paragraphMode?: 'line'(default) | 'block' | 'auto',\n *            standardsRollup? (cn_standards, default on), dropRolledHeadings? }\n *\n * Designed for an n8n Code node (\"Run Once for All Items\", JavaScript) fed the\n * Mistral OCR response (object with pages[].markdown). The pure functions are\n * also Node-testable (see the guarded export block at the bottom).\n * ---------------------------------------------------------------------------\n */\n\n\n// 0. Numeral helpers\n// ===========================================================================\n\n// Chinese numeral characters (simplified + traditional + financial + arabic)\nconst CN_DIGITS = '零〇一二三四五六七八九十百千万两壹贰叁肆伍陆柒捌玖拾佰仟0-9';\n\nfunction cnNumToInt(s) {\n  if (s == null) return null;\n  s = String(s).trim();\n  if (/^\\d+$/.test(s)) return parseInt(s, 10);\n  const d = { 零:0,〇:0,一:1,壹:1,二:2,两:2,贰:2,三:3,叁:3,四:4,肆:4,五:5,伍:5,\n              六:6,陆:6,七:7,柒:7,八:8,捌:8,九:9,玖:9 };\n  const u = { 十:10,拾:10,百:100,佰:100,千:1000,仟:1000 };\n  let total = 0, section = 0, num = 0, matched = false;\n  for (const ch of s) {\n    if (ch in d) { num = d[ch]; matched = true; }\n    else if (ch in u) { if (num === 0) num = 1; section += num * u[ch]; num = 0; matched = true; }\n    else return null; // unknown char -> not a clean numeral\n  }\n  return matched ? (section + num) : null;\n}\n\nfunction romanToInt(s) {\n  if (!s || !/^[IVXLCDM]+$/i.test(s)) return null;\n  s = s.toUpperCase();\n  const v = { I:1, V:5, X:10, L:50, C:100, D:500, M:1000 };\n  let n = 0;\n  for (let i = 0; i < s.length; i++) {\n    const c = v[s[i]], nx = v[s[i + 1]] || 0;\n    n += c < nx ? -c : c;\n  }\n  return n;\n}\n\n// Normalise a Latin-script keyword: lowercase, strip accents, strip plural tail\nfunction normKw(s) {\n  return String(s).toLowerCase()\n    .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '') // drop combining accents\n    .replace(/(es|s)$/, '');                          // chapitres -> chapitre\n}\n\n// ===========================================================================\n// 1. THE MARKER TABLE   {marker -> family -> depth -> label}\n//    Each family declares:\n//      maxDepth : deepest level that becomes its own record by default\n//      sig      : signature regexes (with weights) used for family detection\n//      units    : (cnUnit style) unit-char -> {depth,label,container}\n//      kwunits  : (kwUnit style) normalised-keyword -> {depth,label,container}\n//      markers  : ordered match rules; FIRST match wins. Styles:\n//         cnUnit  - capture[1] = Chinese unit char, looked up in `units`\n//         kwUnit  - capture[1]=keyword 2=number 3=rest, keyword -> `kwunits`\n//         decimal - capture[1]=dotted number 2=rest; depth = baseDepth + #dots\n//         sym     - capture[1]=symbol marker 2=rest (German §)\n//         token   - marker = whole match; rest = text after it\n//    container=true  -> inline text after the marker is a TITLE (joins article)\n//    container=false -> inline text after the marker is CONTENT (seeds contenu)\n// ===========================================================================\n\nconst FAMILIES = {\n\n  // -- System 1: 编/章/节/条/款/项/目 (Legislation Law art. 65) ----------------\n  cn_legislative: {\n    maxDepth: 4, // split down to 条 (article); 款/项/目 fold into contenu\n    preamble: '前言',\n    sig: [\n      { re: new RegExp('第\\\\s*[' + CN_DIGITS + ']+\\\\s*条', 'g'), w: 5 }, // 条 is unique to law\n      { re: new RegExp('第\\\\s*[' + CN_DIGITS + ']+\\\\s*[章节節編编]', 'g'), w: 2 },\n    ],\n    units: {\n      '编':{depth:1,label:'part',container:true}, '編':{depth:1,label:'part',container:true},\n      '分编':{depth:1,label:'subpart',container:true},\n      '章':{depth:2,label:'chapter',container:true},\n      '节':{depth:3,label:'section',container:true}, '節':{depth:3,label:'section',container:true},\n      '条':{depth:4,label:'article',container:false}, '條':{depth:4,label:'article',container:false},\n    },\n    markers: [\n      { style:'cnUnit', re: new RegExp('^第\\\\s*[' + CN_DIGITS + ']+\\\\s*(分编|编|章|节|条|編|節|條)') },\n      { style:'token',  re: /^[（(]([一二三四五六七八九十百零〇两]+)[）)]\\s*/, depth:6, label:'item',    container:false },\n      { style:'token',  re: /^([0-9]+)\\s*[.、．]\\s*/,                          depth:7, label:'subitem', container:false },\n    ],\n  },\n\n  // -- System 2: 一、/（一）/1./（1） (公文处理工作条例 + GB/T 9704) -------------\n  cn_gongwen: {\n    maxDepth: 1, // only 一、 is an article; （一）/1./（1） fold into contenu (one row each)\n    preamble: '引言',\n    sig: [\n      { re: /^[一二三四五六七八九十百]+\\s*、/gm, w: 2 },\n      { re: /^[（(][一二三四五六七八九十百]+[）)]/gm, w: 1 },\n    ],\n    markers: [\n      { style:'token', re: /^([一二三四五六七八九十百]+)\\s*、\\s*/,  depth:1, label:'L1', container:true  },\n      { style:'token', re: /^[（(]([一二三四五六七八九十百]+)[）)]\\s*/, depth:2, label:'L2', container:true  },\n      { style:'token', re: /^([0-9]+)\\s*[.．、]\\s*/,               depth:3, label:'L3', container:false },\n      { style:'token', re: /^[（(]([0-9]+)[）)]\\s*/,               depth:4, label:'L4', container:false },\n    ],\n  },\n\n  // -- System 3: 部分/章/条(decimal)/段/列项/附录 (GB/T 1.1-2020) --------------\n  cn_standards: {\n    maxDepth: 6, // split clause + all decimal sub-clauses; list items fold in\n    preamble: '引言',\n    sig: [\n      { re: /^\\s*\\d+\\.\\d+/gm, w: 3 },\n      { re: /规范性引用文件/g, w: 6 },\n      { re: /^\\s*1[.\\uFF0E]\\s*范围/gm, w: 5 },\n    ],\n    markers: [\n      { style:'token',   re: /^附\\s*录\\s*([A-Z])\\b\\s*/,                       depth:1, label:'annex',     container:true  },\n      { style:'decimal', re: /^([1-9]\\d?(?:\\.\\d+){1,5})(?:[ \\t]+(.*))?$/, baseDepth:1, label:'subclause', container:true  },\n      { style:'decimal', re: /^(\\d{1,2})[.\\uFF0E](?![\\d])[ \\t]*(?![\\d.]*\\s*(?:㎜|㎡|mm|kV|kA|kg|㎏|MPa|m[²³]?\\b|min|℃|%|％|区[指（(]))([\\u4e00-\\u9fff\\uff08(].*)$/, baseDepth:1, label:'clause', container:true  },\n      { style:'decimal', re: /^(\\d{1,2})[ \\t]+(?![\\d.]*\\s*(?:㎜|㎡|mm|kV|kA|kg|㎏|MPa|m[²³]?\\b|min|℃|%|％|区[指（(]))(?!.*[。；：，！？]\\s*$)([\\u4e00-\\u9fff\\uff08(].{0,29})$/, baseDepth:1, label:'clause', container:true  },\n      { style:'token',   re: /^[（(]?([a-z])[)）]\\s+/,                          depth:7, label:'list-a',    container:false },\n      { style:'token',   re: /^([0-9]+)[)）]\\s+/,                              depth:8, label:'list-1',    container:false },\n      { style:'token',   re: /^[—–-]{1,2}\\s+/,                                depth:7, label:'list-dash', container:false },\n      { style:'token',   re: /^[●·•・]\\s?/,                                   depth:8, label:'list-dot',  container:false },\n    ],\n  },\n\n  // -- Latin-script legislation (FR / EN / DE / ES) ---------------------------\n  latin_legislative: {\n    maxDepth: 6, // split down to Article / §; enumerations fold into contenu\n    preamble: 'PREAMBULE',\n    sig: [\n      { re: /\\b(article|artikel|art[íi]culo|chapitre|chapter|cap[íi]tulo|kapitel|secci[óo]n|abschnitt|titre|t[íi]tulo|livre|libro)\\s+[0-9IVXLCDM]/gi, w: 3 },\n    ],\n    kwunits: {\n      livre:{depth:1,label:'book',container:true},   book:{depth:1,label:'book',container:true},\n      libro:{depth:1,label:'book',container:true},   buch:{depth:1,label:'book',container:true},\n      titre:{depth:2,label:'title',container:true},  title:{depth:2,label:'title',container:true},\n      titulo:{depth:2,label:'title',container:true}, titel:{depth:2,label:'title',container:true},\n      partie:{depth:3,label:'part',container:true},  part:{depth:3,label:'part',container:true},\n      parte:{depth:3,label:'part',container:true},   teil:{depth:3,label:'part',container:true},\n      chapitre:{depth:4,label:'chapter',container:true}, chapter:{depth:4,label:'chapter',container:true},\n      capitulo:{depth:4,label:'chapter',container:true}, kapitel:{depth:4,label:'chapter',container:true},\n      section:{depth:5,label:'section',container:true},  seccion:{depth:5,label:'section',container:true},\n      abschnitt:{depth:5,label:'section',container:true},\n      article:{depth:6,label:'article',container:false}, artikel:{depth:6,label:'article',container:false},\n      articulo:{depth:6,label:'article',container:false},\n      paragraphe:{depth:6,label:'paragraph',container:false}, paragraph:{depth:6,label:'paragraph',container:false},\n      parrafo:{depth:6,label:'paragraph',container:false},\n    },\n    markers: [\n      { style:'kwUnit', re: /^([A-Za-zÀ-ÿ]+)\\s+([0-9IVXLCDM]+[A-Za-z0-9.\\-]*)\\b[ \\t]*[:.\\-–—]?[ \\t]*(.*)$/ },\n      { style:'sym',    re: /^(§{1,2}\\s*\\d+[a-z]?)\\b[ \\t]*(.*)$/,            depth:6, label:'paragraph', container:false },\n      { style:'token',  re: /^[（(]?([a-z])[)）][ \\t]+/,                      depth:7, label:'enum-a', container:false },\n      { style:'token',  re: /^([0-9]+)[.)）][ \\t]+/,                         depth:7, label:'enum-1', container:false },\n    ],\n  },\n\n  // -- Fallback: rely on markdown headings only -------------------------------\n  generic: { maxDepth: 9, preamble: 'PREAMBULE', sig: [], markers: [] },\n};\n\n// ===========================================================================\n// 2. Engine\n// ===========================================================================\n\nfunction unwrapMd(line) {\n  // Mistral OCR marks headings with markdown emphasis: \"**3** **纺织织物子分部装修工程**\".\n  // Strip ** / __ / * / _ wrappers so the structural patterns can match the text.\n  line = String(line).replace(/(\\*\\*|__)(.*?)\\1/g, '$2')\n                     .replace(/(?<![*\\w])\\*(?!\\s)([^*\\n]+?)(?<!\\s)\\*(?!\\*)/g, '$1')\n                     .replace(/[ \\t]{2,}/g, ' ');\n  const m = line.match(/^[ \\t]{0,3}(#{1,6})[ \\t]+(.*?)[ \\t]*#*[ \\t]*$/);\n  return m ? { text: m[2], isMd: true } : { text: line, isMd: false };\n}\n\nfunction classifyFamily(md) {\n  md = String(md);\n  let best = 'generic', bestScore = 0;\n  for (const fam of Object.keys(FAMILIES)) {\n    const sig = FAMILIES[fam].sig || [];\n    let score = 0;\n    for (const s of sig) {\n      const re = s.re.global ? s.re : new RegExp(s.re.source, s.re.flags + 'g');\n      score += ((md.match(re) || []).length) * s.w;\n    }\n    if (score > bestScore) { bestScore = score; best = fam; }\n  }\n  return best;\n}\n\nfunction matchMarker(t, cfg) {\n  for (const e of cfg.markers) {\n    const m = t.match(e.re);\n    if (!m) continue;\n\n    if (e.style === 'cnUnit') {\n      const u = cfg.units[m[1]];\n      if (!u) continue;\n      return { marker: m[0].trim(), remainder: t.slice(m[0].length).trim(),\n               depth: u.depth, label: u.label, container: u.container };\n    }\n    if (e.style === 'kwUnit') {\n      const u = cfg.kwunits[normKw(m[1])];\n      if (!u) continue;\n      return { marker: (m[1] + ' ' + m[2]).trim(), remainder: (m[3] || '').trim(),\n               depth: u.depth, label: u.label, container: u.container };\n    }\n    if (e.style === 'decimal') {\n      const dots = (m[1].match(/\\./g) || []).length;\n      return { marker: m[1], remainder: (m[2] || '').trim(),\n               depth: e.baseDepth + dots, label: e.label, container: e.container };\n    }\n    if (e.style === 'sym') {\n      return { marker: m[1].replace(/\\s+/g, ' ').trim(), remainder: (m[2] || '').trim(),\n               depth: e.depth, label: e.label, container: e.container };\n    }\n    // token\n    return { marker: m[0].trim(), remainder: t.slice(m[0].length).trim(),\n             depth: e.depth, label: e.label, container: e.container };\n  }\n  return null;\n}\n\nfunction extractNum(marker) {\n  const s = marker || '';\n  let m = s.match(/\\d+/);\n  if (m) return parseInt(m[0], 10);\n  m = s.match(new RegExp('[' + CN_DIGITS + ']+'));\n  if (m) { const n = cnNumToInt(m[0]); if (n != null) return n; }\n  m = s.match(/[IVXLCDM]+/i);\n  if (m) { const r = romanToInt(m[0]); if (r != null) return r; }\n  return null;\n}\n\n// Headers that open a \"terms and definitions\" section (5 languages)\nconst DEFN_RE = /术语|定义|定義|definition|d[ée]finition|definici[oó]n|begriff/i;\n\n// OCR noise dropped by default: page footers, TOC dotted-leader lines, bare\n// measurement/table cells (100 ㎜², 4 ㎜, φ12 ㎜, 50 ㎜×5 ㎜), and [来源：…] tags.\nconst NOISE_RE = new RegExp(\n  '^\\\\s*(?:' +\n    '[—–‒\\\\-~]{1,3}\\\\s*\\\\d{1,4}\\\\s*[—–‒\\\\-~]{1,3}' +                       // —2— or - 1 -\n    '|第\\\\s*\\\\d{1,4}\\\\s*页(?:\\\\s*[／/]\\\\s*共\\\\s*\\\\d{1,4}\\\\s*页)?' +          // 第3页/共8页\n    '|.{1,60}\\\\.{5,}\\\\s*\\\\d{1,4}' +                                        // TOC dotted leaders\n    '|[\\\\dφΦ][\\\\d\\\\s.×xX㎜㎡²³φΦμµ]*(?:㎜|㎡|mm|kV|kA|㎏|kg|MPa)[²³]?\\\\s*' +  // measurement cells\n    '|\\\\[\\\\s*来\\\\s*源[：:].*\\\\]' +                                          // [来源：GB/T …]\n  ')\\\\s*$'\n);\n\n// A leading markdown list bullet the OCR sometimes prepends to a numbered item,\n// e.g. \"- （一）……\" or \"- 1 现场……\". Stripped so the real marker is at line start.\nconst LIST_BULLET_RE = /^\\s*[-*•·]\\s+(?=[（(]?[0-9一二三四五六七八九十]|[（(])/;\n\n// 公文 sub-heading written inline with its body: \"（一）豁免末端治理设施。在同一个生产线内……\"\n// -> title \"豁免末端治理设施\", tail \"在同一个生产线内……\". Only splits on a SHORT lead\n// sentence, so a normal paragraph that merely contains 。 is never chopped.\nfunction splitInlineHeading(remainder) {\n  const m = String(remainder).match(/^([^。！？]{1,40}?)[。]\\s*(\\S.*)$/);\n  return m ? { title: m[1].trim(), tail: m[2].trim() } : { title: remainder, tail: '' };\n}\n\n// Any structural marker that must start a fresh line (used by dewrap).\nconst ANY_MARKER = /^(?:#{1,6}\\s|第\\s*[0-9一二三四五六七八九十百零〇两]+\\s*[编編章节節条條]|[一二三四五六七八九十百]+\\s*、|[（(][一二三四五六七八九十百]+[）)]|\\d+(?:\\.\\d+)*[ \\t.．、)）]|[（(]\\d+[）)]|[a-z][)）]\\s|§|附\\s*[件录]|[—–-]{1,2}\\s)/;\nconst HEADING_LINE = /^(?:附\\s*[件录]\\s*[0-9A-Z]*\\s*[：:]?|填写说明|目\\s*[录次])$/;\n\n/**\n * Re-join hard-wrapped lines (pdftotext / scanned OCR) into paragraphs.\n * Mistral's markdown is usually already reflowed, so this is OFF by default;\n * enable with { dewrap: true } when a line-per-visual-row extraction is fed in.\n */\n/**\n * Convert Mistral's LaTeX-ish math back to plain Unicode symbols, WITHOUT touching\n * document structure (markers like 6.1 / a) / 第一条 are never inside math).\n *   \\(0.9\\mathrm{m}\\)      -> 0.9 m\n *   \\(1\\times 10^{6}\\Omega\\) -> 1×10⁶ Ω\n *   \\(100\\Omega\\)          -> 100 Ω\n * On by default; disable with { demath: false }.\n */\nconst _GREEK = { alpha:'α',beta:'β',gamma:'γ',delta:'δ',epsilon:'ε',theta:'θ',lambda:'λ',\n  mu:'µ',nu:'ν',pi:'π',rho:'ρ',sigma:'σ',tau:'τ',phi:'φ',omega:'ω',\n  Delta:'Δ',Sigma:'Σ',Omega:'Ω',Phi:'Φ',Pi:'Π',Theta:'Θ',Lambda:'Λ',Gamma:'Γ' };\nconst _SUP = {'0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹','+':'⁺','-':'⁻','n':'ⁿ','i':'ⁱ'};\nconst _SUB = {'0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉','+':'₊','-':'₋'};\nconst _sup = (t) => t.split('').map(c => _SUP[c] || c).join('');\nconst _sub = (t) => t.split('').map(c => _SUB[c] || c).join('');\n\nfunction _demathCore(s) {\n  return s\n    .replace(/\\\\(?:mathrm|mathbf|mathit|mathsf|mathbb|text|operatorname)\\s*\\{([^{}]*)\\}/g, '$1')\n    .replace(/\\\\times\\b/g, '×').replace(/\\\\cdot\\b/g, '·').replace(/\\\\div\\b/g, '÷')\n    .replace(/\\\\pm\\b/g, '±').replace(/\\\\mp\\b/g, '∓')\n    .replace(/\\\\leq\\b|\\\\leqslant\\b/g, '≤').replace(/\\\\geq\\b|\\\\geqslant\\b/g, '≥')\n    .replace(/\\\\neq\\b/g, '≠').replace(/\\\\approx\\b/g, '≈').replace(/\\\\sim\\b/g, '∼')\n    .replace(/\\\\rightarrow\\b|\\\\to\\b/g, '→').replace(/\\\\leftarrow\\b/g, '←')\n    .replace(/\\\\infty\\b/g, '∞').replace(/\\\\propto\\b/g, '∝')\n    .replace(/\\\\circ\\b/g, '°').replace(/\\\\degree\\b/g, '°').replace(/\\\\%/g, '%')\n    .replace(/\\\\([A-Za-z]+)\\b/g, (m, name) => _GREEK[name] || m)   // \\Omega \\mu ...\n    .replace(/\\^\\{([^{}]*)\\}/g, (_, t) => _sup(t)).replace(/\\^(-?\\w)/g, (_, t) => _sup(t))\n    .replace(/_\\{([^{}]*)\\}/g, (_, t) => _sub(t)).replace(/_(-?\\w)/g, (_, t) => _sub(t))\n    .replace(/\\\\left|\\\\right/g, '').replace(/\\\\[,;!: ]/g, ' ')\n    .replace(/\\s*([×·])\\s*/g, '$1')\n    .replace(/(\\d)\\s*(mm|cm|km|m|kg|g|kV|kW|kA|mA|A|V|W|Hz|Pa|kPa|MPa|Ω|℃|°C|°|lx|lm|s|h|min)\\b/g, '$1 $2')\n    .replace(/(\\d)\\s*([Ω℃°])/g, '$1 $2')\n    .replace(/[ \\t]{2,}/g, ' ');\n}\n\nfunction demath(s) {\n  s = String(s);\n  s = s.replace(/\\\\\\(([\\s\\S]*?)\\\\\\)/g, (_, m) => _demathCore(m));   // \\( ... \\)\n  s = s.replace(/\\\\\\[([\\s\\S]*?)\\\\\\]/g, (_, m) => _demathCore(m));   // \\[ ... \\]\n  s = s.replace(/\\$([^$\\n]+?)\\$/g, (_, m) => _demathCore(m));       // $ ... $\n  return _demathCore(s);                                            // bare tokens too\n}\n\nfunction dewrap(md) {\n  const lines = String(md).replace(/\\f/g, '\\n').split(/\\r?\\n/)\n    .map(l => l.trim())\n    .filter(l => l && !NOISE_RE.test(l));           // drop footers first (they split words)\n  const terminal = (s) => /[。！？；：:]$/.test(s) || (/[）】》]$/.test(s) && s.length <= 35);\n  // a heading never ends mid-sentence (、，：), so those are wrapped enumeration lines\n  const standalone = (s) => HEADING_LINE.test(s) ||\n    (ANY_MARKER.test(s) && s.length <= 25 && !/[、，：,:]$/.test(s));\n  const cont = (s) => /^[，、；：。）】》,;:]/.test(s);   // continuation: must attach to prev\n  const out = [];\n  for (const l of lines) {\n    const prev = out[out.length - 1];\n    const join = prev && (cont(l) ||\n      (!terminal(prev) && !standalone(prev) && !ANY_MARKER.test(l)));\n    if (join) out[out.length - 1] = prev + l;        // CJK: no space when joining\n    else out.push(l);\n  }\n  return out.join('\\n');\n}\n\n// Split an article body into paragraphs.\n//   'block' : paragraphs are blank-line-separated blocks (a 款 may span lines)\n//   'line'  : every non-empty line is its own paragraph\n//   'auto'  : block when blank-line separators exist, else line (OCR-robust)\nfunction toParagraphs(lines, mode = 'auto') {\n  const nonEmpty = lines.filter(l => l.trim() !== '');\n  if (!nonEmpty.length) return [];\n  if (mode === 'line') return nonEmpty.map(l => l.trim());\n  const hadBlank = lines.some(l => l.trim() === '');\n  if (mode === 'auto' && !hadBlank) return nonEmpty.map(l => l.trim());\n  const blocks = [];\n  let buf = [];\n  for (const l of lines) {\n    if (l.trim() === '') { if (buf.length) { blocks.push(buf.join('\\n').trim()); buf = []; } }\n    else buf.push(l);\n  }\n  if (buf.length) blocks.push(buf.join('\\n').trim());\n  return blocks.filter(Boolean);\n}\n\n/**\n * Parse OCR markdown into a flat list of structural rows.\n * @param {string} md\n * @param {object} [opts]  see header for the full option list\n */\nfunction parseStructure(md, opts = {}) {\n  if (opts.demath !== false) md = demath(md);   // LaTeX math -> plain symbols (on by default)\n  if (opts.dewrap) md = dewrap(md);\n  const family = opts.family || classifyFamily(md);\n  const cfg = FAMILIES[family] || FAMILIES.generic;\n  const maxDepth = opts.maxDepth != null ? opts.maxDepth : cfg.maxDepth;\n  const explode = opts.explodeParagraphs !== false; // default: one row per paragraph\n  const handleDefns = opts.definitions !== false;   // default: stacked-term handling\n  const paraMode = opts.paragraphMode || 'line';    // 'line' = each non-empty line is a row\n  // Split a container header's title into contenu (第一章 总则 -> \"第一章\" + \"总则\").\n  // Default on for cn_legislative; off elsewhere. Leaf units (条/项) are unaffected.\n  const splitHeads = opts.splitHeaderTitle != null ? opts.splitHeaderTitle\n                                                   : family === 'cn_legislative';\n  // 公文 headings carry their body on the same line after 。 -> keep only the title in article\n  const headSent = opts.headingSentenceSplit != null ? opts.headingSentenceSplit\n                                                     : family === 'cn_gongwen';\n  const stripNoise = opts.stripNoise !== false;     // drop page footers by default\n\n  // Skip front matter (title / 目录 / 前言 / 发文字号 / 主席令 …): start output at the\n  // FIRST real numbered structural marker. TOC entries are ignored (dotted-leader lines\n  // are already noise-dropped; spaced ones end in a page number and are rejected here).\n  // Default on for the three Chinese families, off for latin/generic. If the document has\n  // no structural marker at all, nothing is skipped.\n  const skipFront = opts.skipFrontMatter != null ? opts.skipFrontMatter\n    : (family === 'cn_legislative' || family === 'cn_gongwen' || family === 'cn_standards');\n  if (skipFront) {\n    const L = String(md).split(/\\r?\\n/);\n    let start = -1;\n    for (let i = 0; i < L.length; i++) {\n      if (stripNoise && NOISE_RE.test(L[i])) continue;                     // footer / TOC leader\n      const line = stripNoise ? L[i].replace(LIST_BULLET_RE, '') : L[i];\n      const tt = unwrapMd(line).text.trim();\n      const hh = tt ? matchMarker(tt, cfg) : null;\n      // a real body marker: matches, within depth, and NOT a \"…标题 5\" table-of-contents entry\n      if (hh && hh.depth <= maxDepth && !/\\s\\d{1,4}$/.test(tt)) { start = i; break; }\n    }\n    if (start > 0) md = L.slice(start).join('\\n');                         // drop everything before it\n  }\n\n  // ---- Pass 1: collect article-level blocks (header + raw body lines) ----\n  const blocks = [];\n  let cur = null, defnsDepth = null, inAnnex = false;\n  const push = () => { if (cur) blocks.push(cur); };\n  const open = (b) => { push(); cur = b; };\n\n  for (const raw of String(md).split(/\\r?\\n/)) {\n    if (stripNoise && NOISE_RE.test(raw)) continue;                     // page footer -> drop\n    const rawNoBullet = stripNoise ? raw.replace(LIST_BULLET_RE, '') : raw;  // \"- （一）…\" -> \"（一）…\"\n    const { text, isMd } = unwrapMd(rawNoBullet);\n    const t = text.trim();\n    let hit = t ? matchMarker(t, cfg) : null;\n    // Once the annexes start, a bare integer is a table row / list item, not a clause.\n    if (hit && hit.label === 'annex') inAnnex = true;\n    if (hit && inAnnex && hit.label === 'clause') hit = null;\n\n    if (hit && hit.depth <= maxDepth) {\n      if (defnsDepth != null && hit.depth <= defnsDepth) defnsDepth = null; // left defns section\n      let title = hit.remainder, tail = '';\n      if (headSent && hit.container && title) {                         // \"（一）小标题。正文……\"\n        const s = splitInlineHeading(title); title = s.title; tail = s.tail;\n      }\n      const split = splitHeads && hit.container; // container title -> contenu, not article\n      open({\n        marker: hit.marker,\n        article: (hit.container && !split) ? (title ? hit.marker + ' ' + title : hit.marker)\n                                           : hit.marker,\n        level: hit.depth, label: hit.label, container: hit.container,\n        hadInline: !!(hit.remainder), num: extractNum(hit.marker),\n        inDefns: handleDefns && defnsDepth != null, body: [],\n      });\n      if (split && title) cur.body.push(title);                          // 章/节 title -> contenu\n      else if (!hit.container && hit.remainder) cur.body.push(hit.remainder); // leaf: inline = first 款\n      if (tail) cur.body.push(tail);                                     // 公文 inline body\n      if (handleDefns && DEFN_RE.test(title)) defnsDepth = hit.depth;    // this header opens defns\n    } else if (isMd && t) {\n      open({ marker: '', article: t, level: 1, label: 'heading', container: true,\n             hadInline: true, num: null, inDefns: false, body: [] });\n    } else if (cur) {\n      cur.body.push(rawNoBullet); // keep line (incl. blank lines + deeper markers), bullet stripped\n    } else if (t) {\n      open({ marker: '', article: cfg.preamble || 'PREAMBULE', level: 0, label: 'preamble',\n             container: false, hadInline: false, num: null, inDefns: false, body: [raw] });\n    }\n  }\n  push();\n\n  // ---- Pass 2: render blocks into {article, contenu} rows ----\n  const rows = [];\n  const row = (b, article, contenu, para) =>\n    ({ article, contenu: (contenu || '').trim(),\n       level: b.level, label: b.label, family, num: b.num, para });\n  const pushRows = (b, article, body) => {\n    const paras = explode ? toParagraphs(body, paraMode)\n                          : [body.join('\\n').trim()].filter(Boolean);\n    if (!paras.length) rows.push(row(b, article, '', 1));\n    else paras.forEach((p, i) => rows.push(row(b, article, p, i + 1)));\n  };\n  // definition-aware (article, body) for a block\n  const defResolve = (b) => {\n    let article = b.article, body = b.body;\n    if (b.inDefns && b.container && !b.hadInline && body.length) {\n      const term = body[0].trim();\n      article = term ? b.marker + ' ' + term : b.marker;\n      body = body.slice(1);\n    }\n    return { article, body };\n  };\n\n  const rollup = family === 'cn_standards' && opts.standardsRollup !== false;\n  if (!rollup) {\n    for (const b of blocks) { const r = defResolve(b); pushRows(b, r.article, r.body); }\n    return rows;\n  }\n\n  // ---- Standards roll-up ----\n  // Per top-level clause, the article level = max(1, deepest level in that clause - 1).\n  // Headings at the article level are articles; a shallower clause that only holds\n  // sub-clauses becomes a header row with empty contenu; anything deeper than the\n  // article level rolls up into its ancestor at the article level. 术语和定义 entries\n  // are left untouched (each term keeps its own article).\n  const isDec = (b) => b.label === 'clause' || b.label === 'subclause';\n  const path = (b) => b.marker.split('.');\n  const level = (b) => path(b).length;\n  const topKey = (b) => path(b)[0];                       // clause id (first path component)\n  const decs = blocks.filter(isDec);\n  const dropHeads = opts.dropRolledHeadings === true;\n\n  const clauseMaxD = new Map();\n  const levelsSeen = new Map();          // topKey -> Set of levels that really have a heading\n  for (const b of decs) if (!b.inDefns) {\n    const k = topKey(b);\n    clauseMaxD.set(k, Math.max(clauseMaxD.get(k) || 1, level(b)));\n    if (!levelsSeen.has(k)) levelsSeen.set(k, new Set());\n    levelsSeen.get(k).add(level(b));\n  }\n  // Article level = deepest level in the clause - 1, but never a level that has no\n  // heading of its own (e.g. GB 50xxx \"3.0.1\" numbering has no real \"3.0\" heading,\n  // so the whole clause rolls up to \"3 <title>\").\n  const articleLevel = (b) => {\n    const k = topKey(b);\n    const seen = levelsSeen.get(k) || new Set();\n    let AL = Math.max(1, (clauseMaxD.get(k) || 1) - 1);\n    while (AL > 1 && !seen.has(AL)) AL--;\n    return AL;\n  };\n  const ownerKey = (b) => { const AL = articleLevel(b);\n    return level(b) > AL ? path(b).slice(0, AL).join('.') : b.marker; };\n\n  const groups = new Map();      // \"seg|marker\" -> { block, lines:[] }\n  const items = [];              // ordered render units\n  let pos = 0;\n  // Segment tracking. Some documents restart the same clause numbers in a later\n  // region — e.g. GB standards append a 条文说明 (article-by-article commentary)\n  // that reuses 1.0.1, 2.0.1 … after the annexes. Keying roll-up groups by marker\n  // alone would collapse those repeats into the main body and pull the commentary\n  // forward. Namespacing groups per segment keeps every region at its true document\n  // position: a top-level number that goes backwards (8 -> 1) opens a new segment.\n  let seg = 0, segMaxTop = 0;\n  const topNum = (b) => { const n = parseInt(path(b)[0], 10); return Number.isNaN(n) ? null : n; };\n  for (const b of blocks) {\n    const p = pos++;\n    if (b.inDefns) {                                    // keep per-term definition articles\n      const r = defResolve(b);\n      items.push({ pos: p, block: b, article: r.article, body: r.body });\n    } else if (isDec(b)) {\n      const tn = topNum(b);                             // numbering restart -> next segment\n      // Only real decimal clauses (1.0.1, 4.2 …) advance the high-water mark, so a\n      // leading table-of-contents / bare chapter list (all level-1) never fakes a\n      // restart. A backwards jump on any clause still opens the next segment and\n      // resets the mark for that region.\n      if (tn != null) {\n        if (tn < segMaxTop) { seg++; segMaxTop = tn; }\n        else if (level(b) >= 2) { segMaxTop = Math.max(segMaxTop, tn); }\n      }\n      const owner = ownerKey(b);\n      const mKey = seg + '|' + b.marker, oKey = seg + '|' + owner;\n      if (owner === b.marker) {                         // this clause IS its own article\n        if (!groups.has(mKey)) { groups.set(mKey, { block: b, lines: [] });\n                                 items.push({ pos: p, key: mKey }); }\n        groups.get(mKey).lines.push(...b.body);\n      } else {                                          // deeper than article level -> roll up\n        if (!groups.has(oKey)) { const ob = decs.find(x => x.marker === owner && !x.inDefns);\n                                 groups.set(oKey, { block: ob || b, lines: [] });\n                                 items.push({ pos: p, key: oKey }); }\n        const g = groups.get(oKey);\n        if (!dropHeads) g.lines.push(b.article);        // keep \"4.2.1 访问控制\" line (lossless)\n        g.lines.push(...b.body);\n      }\n    } else {                                            // preamble / annex / heading\n      const r = defResolve(b);\n      items.push({ pos: p, block: b, article: r.article, body: r.body });\n    }\n  }\n  items.sort((a, b) => a.pos - b.pos);\n  for (const it of items) {\n    if (it.key != null) { const g = groups.get(it.key); pushRows(g.block, g.block.article, g.lines); }\n    else pushRows(it.block, it.article, it.body);\n  }\n  return rows;\n}\n\n// Convenience: full pipeline from an OCR response object -> records\nfunction recordsFromOcr(ocr, opts) {\n  const md = (ocr && ocr.pages ? ocr.pages : []).map(p => (p && p.markdown) || '').join('\\n');\n  return parseStructure(md, opts);\n}\n\n// Convenience: pipeline from a { extractedText: \"<full string>\" } input -> records.\n// Also accepts a raw string, or a Mistral OCR response ({ pages[].markdown }) as a\n// fallback, so the node keeps working whichever shape it is fed.\nfunction recordsFromText(input, opts) {\n  let md = '';\n  if (typeof input === 'string') md = input;\n  else if (input && input.extractedText != null) md = String(input.extractedText);\n  else if (input && Array.isArray(input.pages)) md = input.pages.map(p => (p && p.markdown) || '').join('\\n');\n  return parseStructure(md, opts);\n}\n\n// ===========================================================================\n\n// ===========================================================================\n// n8n entry — read extractedText, pick family from Language, then parse\n// ===========================================================================\nconst LANG_TO_FAMILY = {\n  Chinese: null,                 // auto-detect among the 3 Chinese systems\n  French:  'latin_legislative',\n  English: 'latin_legislative',\n  German:  'latin_legislative',\n  Spanish: 'latin_legislative',\n};\n\nconst input = $input.first().json;                 // expects { extractedText: \"<full string>\" }\nlet language = (input && input.language) || 'Chinese';\ntry { if (!(input && input.language)) language = $('Prepare OCR request').first().json.language || language; } catch (e) {}\n\nconst forced = LANG_TO_FAMILY[language];           // null => auto-detect\nconst opts = forced ? { family: forced } : {};     // tune here: maxDepth, paragraphMode, dewrap, etc.\n\n// One n8n item per { article, contenu, level, label, family, num, para }.\n// For strictly {article, contenu}, replace r with { article: r.article, contenu: r.contenu }.\nreturn recordsFromText(input, opts).map(r => ({ json: r }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        0
+      ],
+      "id": "efe5711d-5142-46fd-999d-b42dc2b52409",
+      "name": "Parse structure"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "2ca33840-4cf3-4979-80a9-a4ba3298c4dd",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "cn_legislative",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "cn_legislative"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cab76dd7-5f20-4bac-851a-dee7e7d0ed8d",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "cn_gongwen",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "cn_gongwen"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "e1a72d4f-30da-47b1-80fd-ab2bf0adbd56",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "cn_standards",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "cn_standards"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "none"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1040,
+        0
+      ],
+      "id": "b1c6441d-eb74-4263-9916-75ebb20fdcfa",
+      "name": "Route by family"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "list",
+          "value": "cn_legislative",
+          "cachedResultName": "cn_legislative"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1320,
+        -180
+      ],
+      "id": "7fa0c937-1322-4b5a-8a7d-80dd9ac1e3a3",
+      "name": "Sheet · cn_legislative",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_GOOGLE_SHEETS_CREDENTIAL",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "list",
+          "value": "cn_gongwen",
+          "cachedResultName": "cn_gongwen"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1320,
+        0
+      ],
+      "id": "f564ff4b-41d5-49c2-b7c5-81d851fa50e5",
+      "name": "Sheet · cn_gongwen",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_GOOGLE_SHEETS_CREDENTIAL",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "list",
+          "value": "cn_standards",
+          "cachedResultName": "cn_standards"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1320,
+        180
+      ],
+      "id": "aa76137f-692a-46dd-9ac7-5661c4cf5652",
+      "name": "Sheet · cn_standards",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_GOOGLE_SHEETS_CREDENTIAL",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "On form submission": {
+      "main": [
+        [
+          {
+            "node": "Prepare OCR request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare OCR request": {
+      "main": [
+        [
+          {
+            "node": "Mistral OCR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mistral OCR": {
+      "main": [
+        [
+          {
+            "node": "Parse structure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse structure": {
+      "main": [
+        [
+          {
+            "node": "Route by family",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by family": {
+      "main": [
+        [
+          {
+            "node": "Sheet · cn_legislative",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheet · cn_gongwen",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheet · cn_standards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {}
+}
