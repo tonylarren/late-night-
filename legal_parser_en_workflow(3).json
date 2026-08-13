@@ -1,0 +1,1912 @@
+{
+  "name": "EN legal structure parser (article/contenu)",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "EN legal document parser",
+        "formDescription": "Upload a PDF (UK · IE · AU · HK · IN · NG · ZA · UAE).",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Document",
+              "fieldType": "file",
+              "acceptFileTypes": ".pdf",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        -620,
+        300
+      ],
+      "id": "f0000000-0000-4000-8000-000000000001",
+      "name": "Upload document",
+      "webhookId": "a1b2c3d4-0000-4000-8000-000000000001"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Turn the uploaded file into a base64 data URI for the Mistral OCR API.\nconst out = [];\nfor (let i = 0; i < $input.all().length; i++) {\n  const item = $input.all()[i];\n  const bin = item.binary || {};\n  const key = Object.keys(bin)[0];\n  if (!key) throw new Error('No binary file on the incoming item.');\n  const b = bin[key];\n  const buf = await this.helpers.getBinaryDataBuffer(i, key);\n  const mime = b.mimeType || 'application/pdf';\n  out.push({ json: {\n    fileName: b.fileName || 'document',\n    mimeType: mime,\n    dataUri: 'data:' + mime + ';base64,' + buf.toString('base64')\n  }});\n}\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -400,
+        300
+      ],
+      "id": "f0000000-0000-4000-8000-000000000002",
+      "name": "0 · Prepare file (base64)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.mistral.ai/v1/ocr",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"mistral-ocr-latest\", document: { type: \"document_url\", document_url: $json.dataUri }, include_image_base64: false }) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -180,
+        300
+      ],
+      "id": "f0000000-0000-4000-8000-000000000003",
+      "name": "Mistral OCR"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* ============ SHARED ============ */\n\nvar ORDINAL_WORDS = {\n  one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9, ten:10,\n  eleven:11, twelve:12, thirteen:13, fourteen:14, fifteen:15, sixteen:16,\n  seventeen:17, eighteen:18, nineteen:19, twenty:20,\n  first:1, second:2, third:3, fourth:4, fifth:5, sixth:6, seventh:7, eighth:8,\n  ninth:9, tenth:10\n};\nvar ORD_WORD_RE = Object.keys(ORDINAL_WORDS).join('|');\n\nvar ROMAN_RE = /^[ivxlcdm]+$/i;\n\nfunction romanToInt(s) {\n  var m = { i:1, v:5, x:10, l:50, c:100, d:500, m:1000 }, t = 0, p = 0, i;\n  s = String(s).toLowerCase();\n  for (i = s.length - 1; i >= 0; i--) {\n    var v = m[s[i]] || 0;\n    t += v < p ? -v : v;\n    p = Math.max(p, v);\n  }\n  return t;\n}\n\n/* numeric value of a marker token, for monotonicity / TOC detection */\nfunction markerValue(tok) {\n  if (tok == null) return NaN;\n  tok = String(tok).trim();\n  var m = tok.match(/^(\\d+)/);\n  if (m) return parseInt(m[1], 10);\n  if (ROMAN_RE.test(tok)) return romanToInt(tok);\n  var w = ORDINAL_WORDS[tok.toLowerCase()];\n  return w == null ? NaN : w;\n}\n\n/* Units / measurement tails that must never open a provision. */\nvar UNIT_TAIL = '(?:mm|cm|km|kg|kV|kA|kW|MW|MPa|kPa|Hz|MHz|GHz|ms|min|sec|hrs?|%|per\\\\s?cent|°C|℃|m[²³]?\\\\b|ft|in\\\\b|lbs?\\\\b)';\n\n/* Lines that are pure furniture. */\nvar NOISE_RES = [\n  /^\\s*[-–—~]{1,3}\\s*\\d{1,4}\\s*[-–—~]{1,3}\\s*$/,          // - 12 -\n  /^\\s*(?:page\\s+)?\\d{1,4}\\s*(?:of|\\/)\\s*\\d{1,4}\\s*$/i,    // 3 of 8 · Page 3/8\n  /^\\s*page\\s+\\d{1,4}\\s*$/i,\n  /^\\s*\\d{1,4}\\s*$/,                                        // bare page number\n  /^\\s*[ivxlcdm]{1,6}\\s*$/i,                                // roman page number\n  /^.{1,80}[.·]{4,}\\s*\\d{1,4}\\s*$/,                         // TOC dotted leader\n  /^\\s*_{3,}\\s*$/,\n  /^\\s*(?:\\[\\d{1,6}\\]|\\d{1,6})(?:\\s+(?:\\[\\d{1,6}\\]|\\d{1,6}))?\\s*$/,   // \"[283] 7\" · \"44 [283]\"\n  /^\\s*[A-Z .]{0,40}\\s*\\d{1,4}\\s*\\[\\d{1,6}\\]\\s*$/,\n  /^\\s*\\[?\\s*(?:this page (?:is )?(?:intentionally )?(?:left )?blank)\\s*\\]?\\s*$/i,\n  /^\\s*(?:unofficial|informal)\\s+translation\\s*$/i,\n  /^\\s*compilation\\s+no\\.?\\s*\\d+\\s*$/i,\n  /^\\s*registered\\s*:\\s*\\d/i,\n  /^\\s*\\d{0,3}\\s*OJ\\s+(?:No\\.|L\\b|C\\b)/,                                   // EU OJ footnote\n  /^\\s*Notice of the making of this Statutory Instrument was published/i,\n  /^\\s*(?:GIVEN under my hand|Given under my (?:hand|Official Seal))/i,\n  /^\\s*THE\\s+GAZETTE\\s+OF\\s+INDIA\\b/i,\n  /^\\s*\\[?\\s*PART\\s+[IVX]+\\s*[\\u2014-]{0,2}\\s*SEC\\.?[^\\]]*\\]?\\s*$/i,      // [PART II-SEC. 3(ii)]\n  /^\\s*\\u0939\\u093F|^\\s*\\[\\s*\\u092D\\u093E\\u0917/,                            // Hindi gazette banner\n  /^\\s*\\(?(?:Published|To be published) in the Gazette/i\n];\n\n/* Dialect-scoped strippers: applied to a whole line, in place. */\nvar STRIPPERS = {\n  /* Hong Kong inline source notes: (Amended 12 of 1999 s. 3) */\n  hk_source: /\\s*\\((?:Amended|Added|Replaced|Repealed|Format changes)[^()]*(?:\\([^()]*\\)[^()]*)*\\)\\s*$/g,\n  /* UK legislation.gov.uk textual-amendment markers: [F1 …] */\n  uk_fmark: /\\[?F\\d{1,4}\\]?/g,\n  /* Ireland eISB markers: F5[ … ]F5 */\n  ie_fmark: /F\\d{1,4}\\[|\\]F\\d{1,4}/g,\n  /* South Africa consolidation editorial notes */\n  za_edit: /\\[[^\\]]*?(?:substituted|inserted|added|deleted|amended|repealed|commencement|Sub-s\\.|Para\\.)[^\\]]*?\\]/gi,\n  /* India / SEBI / RBI superscript footnote caller fused to a bracket: 3[ … ] */\n  in_bracket_open: /(^|[\\s(])(\\d{1,3})\\[/g,\n  in_omitted: /\\*{3,}/g,\n  /* Editorial asterisk / hash prefixes (HK not-yet-in-operation) */\n  hk_flag: /^\\s*[*#]+\\s*/\n};\n\n/* Non-boundary content markers — kept inside `contenu`, used only to\n   disambiguate and to repair OCR line merges. */\nvar RE_SUBSEC   = /^\\s*\\((\\d{1,3}[A-Z]{0,2})\\)\\s+/;\nvar RE_PARA_A   = /^\\s*\\(([a-z]{1,3})\\)\\s+/;\nvar RE_PARA_ROM = /^\\s*\\(([ivxlcdm]{1,8})\\)\\s+/;\nvar RE_PARA_CAP = /^\\s*\\(([A-Z]{1,3})\\)\\s+/;\nvar RE_IE_DEG   = /^\\s*(\\d{1,2})\\s*[\\u00B0\\u00BA\\u02DA]\\s*(.*)$/;   // Irish 1° 2° 3°\n\n/* Special content blocks (tagged, never boundaries). */\nvar RE_PROVISO     = /^\\s*Provided\\s+(?:that|further|also|always)\\b/i;\nvar RE_EXPLANATION = /^\\s*Explanation\\s*(\\d+)?\\s*[.:\\u2014-]/i;\nvar RE_ILLUSTR     = /^\\s*Illustrations?\\s*[.:\\u2014-]?\\s*$/i;\nvar RE_NOTE_AU     = /^\\s*Note\\s*(\\d+)?\\s*:/i;\nvar RE_PENALTY_AU  = /^\\s*(?:Maximum\\s+)?Penalt(?:y|ies)\\s*:/i;\nvar RE_REPEALED    = /^\\s*\\(?(Repealed|Omitted|Deleted|Not yet in operation)\\)?\\s*\\.?\\s*$/i;\n\n/* TOC entry / exit. */\nvar RE_TOC_HEAD = /^\\s*(?:ARRANGEMENT\\s+OF\\s+(?:SECTIONS|CLAUSES|PARAGRAPHS|RULES|REGULATIONS|ARTICLES|ORDERS)|TABLE\\s+OF\\s+(?:PROVISIONS|CONTENTS)|CONTENTS|INDEX\\s+OF\\s+SECTIONS|SECTIONS)\\s*$/i;\nvar RE_TOC_EXIT = /(?:BE\\s+IT\\s+ENACTED|ENACTED\\s+by|^\\s*An?\\s+ACT\\s+to\\b|^\\s*WHEREAS\\b|^\\s*PREAMBLE\\b|in\\s+exercise\\s+of\\s+the\\s+(?:powers|functions)\\s+conferred|hereby\\s+(?:make|makes|order|orders|prescribe|prescribes|issue|issues)\\b|Now,?\\s+therefore)/i;\n\n/* Front matter that precedes the operative body. */\nvar RE_LONG_TITLE = /^\\s*An?\\s+(?:Act|Ordinance|Law|Bill)\\s+to\\b/i;\nvar RE_ENACTING   = /^\\s*(?:BE\\s+IT\\s+ENACTED|ENACTED\\s+by|Now,?\\s+therefore|The\\s+Parliament\\s+of|Do\\s+hereby\\s+(?:issue|decree|promulgate))/i;\nvar RE_PREAMBLE   = /^\\s*(?:PREAMBLE|WHEREAS\\b|Having\\s+reviewed\\b|Having\\s+perused\\b)/i;\n\nfunction esc(s) { return String(s).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'); }\n\nfunction isNoise(line) {\n  for (var i = 0; i < NOISE_RES.length; i++) if (NOISE_RES[i].test(line)) return true;\n  return false;\n}\n\n/* ============ STAGE 1 · clean ============ */\n\n/* Clean text: normalise, de-markdown, drop furniture, optional dewrap,\n   TOC guard. Dialect-agnostic — nothing here needs to know the country. */\n\n/* ---------------------------------------------------------------\n   Mistral OCR renders superscripts, units and symbols as LaTeX:\n     \"31$^{st}$ December\"        -> \"31st December\"\n     \"$\\mathrm{m}^{3}$\"          -> \"m3\"  (unicode superscript)\n     \"$\\mu \\mathrm{g} / \\mathrm{m}^{3}$\" -> \"ug/m3\"\n     \"${ }^{\\circ} \\mathrm{C}$\"  -> \"degC\"\n   A \"$...$\" span is only treated as maths when it actually contains\n   maths syntax, so a currency amount like \"$8.00\" is left alone.\n   --------------------------------------------------------------- */\nvar SUP_MAP = { '0':'\\u2070','1':'\\u00B9','2':'\\u00B2','3':'\\u00B3','4':'\\u2074','5':'\\u2075',\n                '6':'\\u2076','7':'\\u2077','8':'\\u2078','9':'\\u2079','+':'\\u207A','-':'\\u207B','n':'\\u207F' };\nvar SUB_MAP = { '0':'\\u2080','1':'\\u2081','2':'\\u2082','3':'\\u2083','4':'\\u2084','5':'\\u2085',\n                '6':'\\u2086','7':'\\u2087','8':'\\u2088','9':'\\u2089','+':'\\u208A','-':'\\u208B' };\n\nvar TEX_SYMBOLS = {\n  'circ':'\\u00B0', 'degree':'\\u00B0', 'deg':'\\u00B0',\n  'times':'\\u00D7', 'cdot':'\\u00B7', 'div':'\\u00F7', 'pm':'\\u00B1', 'mp':'\\u2213',\n  'leq':'\\u2264', 'le':'\\u2264', 'geq':'\\u2265', 'ge':'\\u2265', 'neq':'\\u2260', 'ne':'\\u2260',\n  'approx':'\\u2248', 'sim':'~', 'equiv':'\\u2261', 'propto':'\\u221D', 'infty':'\\u221E',\n  'rightarrow':'\\u2192', 'to':'\\u2192', 'leftarrow':'\\u2190', 'leftrightarrow':'\\u2194',\n  'Rightarrow':'\\u21D2', 'Leftarrow':'\\u21D0',\n  'alpha':'\\u03B1','beta':'\\u03B2','gamma':'\\u03B3','delta':'\\u03B4','epsilon':'\\u03B5',\n  'lambda':'\\u03BB','mu':'\\u00B5','nu':'\\u03BD','pi':'\\u03C0','rho':'\\u03C1','sigma':'\\u03C3',\n  'tau':'\\u03C4','phi':'\\u03C6','omega':'\\u03C9','Delta':'\\u0394','Omega':'\\u03A9','Sigma':'\\u03A3',\n  'ldots':'...', 'dots':'...', 'cdots':'...', 'prime':\"'\", 'ast':'*', 'star':'*',\n  'bullet':'\\u2022', 'dagger':'\\u2020', 'S':'\\u00A7', 'P':'\\u00B6', 'copyright':'\\u00A9',\n  'pounds':'\\u00A3', 'euro':'\\u20AC', 'textdegree':'\\u00B0', 'textcelsius':'\\u00B0C',\n  'percent':'%', 'slash':'/', 'backslash':'\\\\'\n};\n\nvar TEX_DROP = /\\\\(?:left|right|big{1,2}|Big{1,2}|quad|qquad|,|;|:|!|displaystyle|textstyle|scriptstyle|limits|nolimits|hspace\\{[^}]*\\}|vspace\\{[^}]*\\}|label\\{[^}]*\\}|;)/g;\nvar TEX_FONT = /\\\\(?:mathrm|mathbf|mathit|mathsf|mathtt|mathcal|mathbb|text|textbf|textit|textrm|textsf|texttt|operatorname|boldsymbol|bm|emph|underline)\\s*\\{/;\n\nfunction texScript(body, map) {\n  var out = '', ok = true;\n  for (var i = 0; i < body.length; i++) {\n    var ch = body[i];\n    if (map[ch] != null) out += map[ch];\n    else if (ch === ' ') continue;\n    else { ok = false; break; }\n  }\n  return ok && out ? out : null;\n}\n\n/* strip \\cmd{...} font wrappers, keeping the braced content, until stable */\nfunction stripTexFonts(t) {\n  for (var pass = 0; pass < 12; pass++) {\n    var m = t.match(TEX_FONT);\n    if (!m) break;\n    var start = m.index, open = start + m[0].length, depth = 1, i;\n    for (i = open; i < t.length && depth > 0; i++) {\n      if (t[i] === '{') depth++;\n      else if (t[i] === '}') depth--;\n    }\n    if (depth !== 0) { t = t.slice(0, start) + t.slice(open); continue; }\n    t = t.slice(0, start) + t.slice(open, i - 1) + t.slice(i);\n  }\n  return t;\n}\n\nfunction texToText(x) {\n  x = stripTexFonts(x);\n  x = x.replace(TEX_DROP, ' ');\n  x = x.replace(/\\\\begin\\{[^}]*\\}|\\\\end\\{[^}]*\\}/g, ' ');\n  x = x.replace(/\\\\\\\\/g, ' ');\n  x = x.replace(/\\\\frac\\s*\\{([^{}]{1,60})\\}\\s*\\{([^{}]{1,60})\\}/g, '$1/$2');\n  x = x.replace(/\\\\sqrt\\s*\\{([^{}]{1,60})\\}/g, 'sqrt($1)');\n  x = x.replace(/~/g, ' ');\n\n  /* ordinal suffixes stay on the baseline: 31^{st} -> 31st */\n  x = x.replace(/\\^\\s*\\{\\s*(st|nd|rd|th)\\s*\\}/gi, '$1');\n  x = x.replace(/\\^\\s*(st|nd|rd|th)\\b/gi, '$1');\n\n  /* degree sign written as a superscript circle */\n  x = x.replace(/\\{\\s*\\}\\s*\\^\\s*\\{\\s*\\\\circ\\s*\\}/g, '\\u00B0');\n  x = x.replace(/\\^\\s*\\{\\s*\\\\circ\\s*\\}/g, '\\u00B0');\n\n  /* super/subscripts -> unicode where the whole body maps cleanly */\n  x = x.replace(/\\^\\s*\\{([^{}]{1,6})\\}/g, function (m0, b) { return texScript(b, SUP_MAP) || ('^' + b); });\n  x = x.replace(/_\\s*\\{([^{}]{1,6})\\}/g,  function (m0, b) {\n    var u = texScript(b, SUB_MAP);\n    if (u) return u;\n    return /^[A-Za-z]{1,4}$/.test(b.trim()) ? b.trim() : ('_' + b);\n  });\n  x = x.replace(/\\^([0-9n+-])/g, function (m0, b) { return SUP_MAP[b] || m0; });\n  x = x.replace(/_([0-9+-])/g,  function (m0, b) { return SUB_MAP[b] || m0; });\n\n  /* named symbols */\n  x = x.replace(/\\\\([A-Za-z]+)\\s*/g, function (m0, name) {\n    if (TEX_SYMBOLS[name] != null) return TEX_SYMBOLS[name];\n    return name + ' ';\n  });\n  /* escaped punctuation */\n  x = x.replace(/\\\\([%&_#$~^{}])/g, '$1');\n  x = x.replace(/[{}]/g, '');\n\n  /* LaTeX spacing is presentational - repair it for prose */\n  x = x.replace(/\\s+\\./g, '.')                                  // \"sq . m\" -> \"sq. m\"\n       .replace(/\\s+%/g, '%')                                    // \"50 %\"   -> \"50%\"\n       .replace(/(\\u00B0)\\s+([CF])\\b/g, '$1$2')                 // \"850 ° C\" -> \"850°C\"\n       .replace(/(\\u00B5)\\s+([A-Za-z])/g, '$1$2')                // \"µ g\"    -> \"µg\"\n       .replace(/([0-9A-Za-z\\u00B2\\u00B3])\\s*([\\u2264\\u2265\\u2260\\u00D7\\u00F7\\u00B1=<>])\\s*/g, '$1 $2 ')\n       .replace(/\\s*\\/\\s*/g, '/');                              // \"Kcal / kg\" -> \"Kcal/kg\"\n  return x.replace(/\\s{2,}/g, ' ').trim();\n}\n\n/* does this \"$...$\" span actually contain maths? */\nfunction looksLikeTex(body) {\n  return /[\\\\^_]/.test(body) || /\\{.*\\}/.test(body);\n}\n\nfunction deLatex(t) {\n  if (t.indexOf('$') < 0 && t.indexOf('\\\\') < 0) return t;\n\n  /* \\( ... \\) and \\[ ... \\] delimiters */\n  t = t.replace(/\\\\\\(([\\s\\S]{1,600}?)\\\\\\)/g, function (m0, b) { return texToText(b); });\n  t = t.replace(/\\\\\\[([\\s\\S]{1,600}?)\\\\\\]/g, function (m0, b) { return ' ' + texToText(b) + ' '; });\n\n  /* $$ display maths */\n  t = t.replace(/\\$\\$([\\s\\S]{1,600}?)\\$\\$/g, function (m0, b) { return ' ' + texToText(b) + ' '; });\n\n  /* $ inline maths - only when the body looks like maths (protects currency) */\n  t = t.replace(/\\$([^$\\n]{1,300}?)\\$/g, function (m0, b) {\n    return looksLikeTex(b) ? texToText(b) : m0;\n  });\n\n  /* bare LaTeX left outside any delimiter */\n  if (/\\\\(?:mathrm|text|mathbf|circ|mu|times|leq|geq|pm|rightarrow|%)/.test(t)) t = texToText(t);\n\n  /* \"31 st December\" -> \"31st December\" (superscript lost its delimiters) */\n  t = t.replace(/(\\d)\\s+(st|nd|rd|th)\\b/g, '$1$2');\n  return t;\n}\n\nfunction stripMarkdown(t) {\n  return t\n    .replace(/^\\s{0,3}#{1,6}\\s+/gm, '')          // ATX headings\n    .replace(/\\*\\*(.+?)\\*\\*/g, '$1')             // bold\n    .replace(/__(.+?)__/g, '$1')\n    .replace(/(^|[^*])\\*(?!\\s)([^*\\n]+?)\\*(?!\\*)/g, '$1$2')   // italic\n    .replace(/^\\s{0,3}>\\s?/gm, '')               // block quotes\n    /* Mistral renders provision items as markdown bullets: \"- (a) ...\", \"-(a) ...\",\n       \"* (b) ...\", escaped \"\\\\- (c) ...\", nested \"- - (d) ...\". Strip repeatedly so\n       nested markers unwind; an em dash at line start is real text and is kept. */\n    .replace(/^((?:[ \\t]*\\\\?[-*+\\u2022\\u00B7](?:[ \\t]+|(?=\\()))+)/gm, '')\n    .replace(/^\\s*\\|\\s*-+[\\s|:-]*\\|\\s*$/gm, '')  // md table rules\n    .replace(/\\\\\\[|\\\\\\]|\\\\\\(|\\\\\\)/g, '');        // stray latex delimiters\n}\n\nfunction normalize(text, opts) {\n  opts = opts || {};\n  var t = String(text == null ? '' : text);\n\n  if (typeof t.normalize === 'function') { try { t = t.normalize('NFKC'); } catch (e) {} }\n\n  t = t\n    .replace(/\\r\\n?/g, '\\n')\n    .replace(/\\f/g, '\\n')\n    .replace(/[\\u200B-\\u200D\\uFEFF\\u00AD]/g, '')          // zero-width, soft hyphen\n    .replace(/[\\u00A0\\u2007\\u202F\\u2009\\u2002-\\u2006]/g, ' ')\n    .replace(/[\\u2018\\u2019\\u2032]/g, \"'\")\n    .replace(/[\\u201C\\u201D\\u2033]/g, '\"')\n    .replace(/[\\u2010\\u2011\\u2012\\u2013\\u2015\\u2212]/g, '\\u2014')  // dashes -> em dash\n    .replace(/\\u2014{2,}/g, '\\u2014')\n    .replace(/\\u2026/g, '...');\n\n  if (opts.deLatex !== false) t = deLatex(t);\n  if (opts.stripMarkdown !== false) t = stripMarkdown(t);\n\n  t = t.replace(/[ \\t]+/g, ' ').replace(/ +$/gm, '');\n  return t;\n}\n\n/* Repeated running headers / footers: any identical line seen >= n times. */\nfunction dropRepeatedLines(lines, minRepeat) {\n  minRepeat = minRepeat || 4;\n  var count = Object.create(null), i, k;\n  for (i = 0; i < lines.length; i++) {\n    k = lines[i].trim();\n    if (k.length >= 4 && k.length <= 120) count[k] = (count[k] || 0) + 1;\n  }\n  var out = [];\n  for (i = 0; i < lines.length; i++) {\n    k = lines[i].trim();\n    if (k && count[k] >= minRepeat && !/[.;:]$/.test(k)) continue;\n    out.push(lines[i]);\n  }\n  return out;\n}\n\n/* Re-join hard-wrapped extractions (pdftotext). Mistral output is reflowed\n   already, so this is opt-in. */\n/* A real enumeration marker: digits, a letter in parens, or a roman numeral.\n   NOT any short word ending in a period (\"work.\" is prose, not a marker). */\nvar BARE_MARKER = /^\\s*(?:\\(\\s*(?:\\d{1,3}[A-Z]{0,2}|[a-z]{1,3}|[ivxlcdm]{1,6}|[A-Z]{1,3})\\s*\\)|\\d{1,4}[A-Z]{0,3}\\.|\\d{1,3}\\)|[a-z]\\))\\s*$/;\nvar MARKER_START = /^\\s*(?:\\(\\s*(?:\\d{1,3}[A-Z]{0,2}|[a-z]{1,3}|[ivxlcdm]{1,6}|[A-Z]{1,3})\\s*\\)|\\d{1,4}[A-Z]{0,3}\\.|\\d{1,3}\\)|[a-z]\\))\\s/;\nvar CAPS_HEADING = /^[A-Z][A-Z0-9 \\-'(),.\\u2014]{5,}$/;\n\nfunction dewrap(t) {\n  var lines = t.split('\\n'), out = [], buf = '';\n  function flush() { if (buf) { out.push(buf); buf = ''; } }\n  for (var i = 0; i < lines.length; i++) {\n    var ln = lines[i];\n    if (!ln.trim()) {\n      if (BARE_MARKER.test(buf)) continue;          // a lone marker waits for its text\n      flush(); out.push(''); continue;\n    }\n    var startsStructure =\n      /^\\s*(?:PART|CHAPTER|SCHEDULE|ANNEX|ORDER|Division|Subdivision|Article|Section|Rule|Regulation)\\b/i.test(ln) ||\n      MARKER_START.test(ln) || BARE_MARKER.test(ln) ||\n      /^\\s*\\[\\d+\\]/.test(ln) ||\n      CAPS_HEADING.test(ln.trim());\n    if (!buf) { buf = ln.trim(); continue; }\n    if (BARE_MARKER.test(buf)) { buf = buf.trim() + ' ' + ln.trim(); continue; }\n    if (startsStructure || /[.;:]$/.test(buf) || CAPS_HEADING.test(buf.trim())) { flush(); buf = ln.trim(); }\n    else buf = buf.replace(/-$/, '') + (/-$/.test(buf) ? '' : ' ') + ln.trim();\n  }\n  flush();\n  return out.join('\\n');\n}\n\n\n/* TOC guard (Vol. I §6.1). Enter on an explicit header; exit on the first\n   backwards jump in top-level numbering, on an enacting formula, or on a\n   heading immediately followed by a subsection marker. */\nfunction stripTOC(lines) {\n  var out = [], inToc = false, high = 0, tocStart = -1, i;\n  for (i = 0; i < lines.length; i++) {\n    var ln = lines[i], t = ln.trim();\n\n    if (!inToc && RE_TOC_HEAD.test(t)) { inToc = true; high = 0; tocStart = i; continue; }\n\n    if (inToc) {\n      if (!t) continue;\n      if (RE_TOC_EXIT.test(t)) { inToc = false; out.push(ln); continue; }\n\n      var m = t.match(/^(\\d{1,4})[A-Z]{0,3}[.\\s]/);\n      if (m) {\n        var v = markerValue(m[1]);\n        if (!isNaN(v)) {\n          if (v < high) { inToc = false; out.push(ln); continue; }   // backwards jump = body\n          high = Math.max(high, v);\n        }\n      }\n      /* a heading immediately followed by a subsection marker is body, not TOC */\n      var nxt = (lines[i + 1] || '').trim();\n      if (m && (RE_SUBSEC.test(nxt) || /^\\(\\d+\\)/.test(nxt))) { inToc = false; out.push(ln); continue; }\n      continue;                                     // swallow TOC line\n    }\n    out.push(ln);\n  }\n  /* if we never found an exit the whole tail got eaten — bail out safely */\n  if (inToc && tocStart >= 0) return lines.slice(0);\n  return out;\n}\n\nfunction cleanText(input, opts) {\n  opts = opts || {};\n  var t = normalize(input, opts);\n\n  var lines = t.split('\\n');\n  if (opts.dropRepeated !== false) lines = dropRepeatedLines(lines, opts.minRepeat || 4);\n  lines = lines.filter(function (l) { return !isNoise(l); });\n  if (opts.skipTOC !== false) lines = stripTOC(lines);\n  if (opts.dewrap) lines = dewrap(lines.join('\\n')).split('\\n');\n\n  /* collapse >2 blank lines */\n  var out = [], blanks = 0;\n  for (var i = 0; i < lines.length; i++) {\n    if (!lines[i].trim()) { blanks++; if (blanks > 1) continue; }\n    else blanks = 0;\n    out.push(lines[i].replace(/\\s+$/, ''));\n  }\n  while (out.length && !out[0].trim()) out.shift();\n  while (out.length && !out[out.length - 1].trim()) out.pop();\n  return out.join('\\n');\n}\n\n/* Input adapter — same contract as the Chinese parser. */\nfunction recordsFromText(input) {\n  if (input == null) return '';\n  if (typeof input === 'string') return input;\n  if (Array.isArray(input)) {\n    return input.map(function (p) {\n      if (typeof p === 'string') return p;\n      return p.markdown || p.text || p.extractedText || p.content || '';\n    }).join('\\n\\n');\n  }\n  if (typeof input === 'object') {\n    if (typeof input.extractedText === 'string') return input.extractedText;\n    if (typeof input.text === 'string') return input.text;\n    if (typeof input.markdown === 'string') return input.markdown;\n    if (Array.isArray(input.pages)) return recordsFromText(input.pages);\n  }\n  return String(input);\n}\n\n/* ============ STAGE 2 · detect + blocks ============ */\n\n/* Detect doc_class, then jurisdiction dialect, apply dialect strippers,\n   split zones, and run Pass 1 into structural blocks. */\n\n/* ---------- Stage 2a: document class ---------- */\n\nvar CLASS_SIGNALS = [\n  // standards\n  { cls: 'standard',    w: 8, re: /^\\s*2\\s+Normative references\\s*$/im },\n  { cls: 'standard',    w: 7, re: /^\\s*Annex\\s+[A-Z]{1,2}\\s*\\(\\s*(?:normative|informative)\\s*\\)/im },\n  { cls: 'standard',    w: 4, re: /^\\s*(?:1\\s+Scope|3\\s+Terms and definitions)\\s*$/im },\n  { cls: 'standard',    w: 3, re: /\\b(?:BS\\s+EN|AS\\/NZS|SANS|IS\\s*\\d{3,5}|UAE\\.S|ISO\\/IEC|ISO\\s+\\d{3,5})\\b/ },\n  // judgments\n  { cls: 'judgment',    w: 9, re: /\\[\\d{4}\\]\\s+(?:UKSC|UKHL|UKPC|EWCA\\s+(?:Civ|Crim)|EWHC|IESC|IECA|IEHC|HKCFA|HKCA|HKCFI|HCA|FCAFC|FCA|ZACC|ZASCA|INSC)\\b/ },\n  { cls: 'judgment',    w: 5, re: /(?:^|\\n)\\s*\\[\\d{1,3}\\]\\s+[A-Z][^\\n]{20,}(?:\\n[\\s\\S]{0,400}?){0,2}\\n\\s*\\[\\d{1,3}\\]\\s+[A-Z]/ },\n  { cls: 'judgment',    w: 4, re: /\\bJUDGMENT\\b|\\bbefore\\s*:\\s*(?:Lord|Lady|The Hon)/i },\n  // court rules\n  { cls: 'court_rules', w: 7, re: /^\\s*ORDER\\s+(?:[IVXLCDM]+|\\d+)\\b/im },\n  { cls: 'court_rules', w: 6, re: /\\bPRACTICE\\s+DIRECTION\\b|\\bCIVIL\\s+PROCEDURE\\s+RULES\\b|\\bRules of the (?:Superior Courts|High Court|Supreme Court)\\b/i },\n  { cls: 'court_rules', w: 4, re: /^\\s*\\d{1,3}\\.\\d{1,3}\\s+[A-Z]/m },\n  // regulatory\n  { cls: 'regulatory',  w: 8, re: /^\\s*[A-Z]{2,6}\\s+\\d+[A-Z]?(?:\\.\\d+[A-Z]?){1,3}\\s+(?:R|E|G|D|P|C|UK|EU)\\b/m },\n  { cls: 'regulatory',  w: 7, re: /\\bPrudential\\s+(?:Standard|Practice Guide)\\s+[A-Z]{2,3}[SG]\\s*\\d+|^\\s*RG\\s+\\d+\\.\\d+/im },\n  { cls: 'regulatory',  w: 6, re: /\\bMASTER\\s+(?:CIRCULAR|DIRECTION)\\b|\\bSEBI\\/[A-Z0-9\\/]+|\\bRBI\\/\\d{4}-\\d{2}\\b/i },\n  { cls: 'regulatory',  w: 4, re: /\\b(?:Handbook|Rulebook|Sourcebook|Conduct Standard|Circular No\\.)\\b/i },\n  // constitution\n  { cls: 'constitution',w: 8, re: /\\bCONSTITUTION\\s+OF\\b|\\bBUNREACHT\\s+NA\\s+H[EÉ]IREANN\\b|\\bBASIC\\s+LAW\\b/i },\n  { cls: 'constitution',w: 4, re: /\\bFUNDAMENTAL\\s+RIGHTS\\b|\\bDIRECTIVE\\s+PRINCIPLES\\b|\\bBILL\\s+OF\\s+RIGHTS\\b/i },\n  // subsidiary\n  { cls: 'subsidiary',  w: 6, re: /\\bG\\.?\\s?S\\.?\\s?R\\.?\\s*\\d+\\s*\\(E\\)|\\bS\\.?\\s?O\\.?\\s*\\d+\\s*\\(E\\)/ },\n  { cls: 'subsidiary',  w: 6, re: /\\bS\\.I\\.\\s*No\\.\\s*\\d+\\s*of\\s*\\d{4}|\\b\\d{4}\\s+No\\.\\s*\\d+\\b|\\bL\\.N\\.\\s*\\d+\\s+of\\s+\\d{4}/i },\n  { cls: 'subsidiary',  w: 5, re: /\\bGN\\s?R?\\.?\\s*\\d+,?\\s*G\\.?\\s*\\d+\\b|\\bGovernment Notice\\b/i },\n  { cls: 'subsidiary',  w: 5, re: /\\b(?:Regulations|Rules|Order)\\s+\\d{4}\\s*$/im },\n  { cls: 'subsidiary',  w: 4, re: /\\bCabinet\\s+(?:Resolution|Decision)\\s+No\\.|\\bMinisterial\\s+(?:Resolution|Decision)\\s+No\\.|\\bExecutive\\s+Regulations?\\b/i }\n];\n\nfunction classifyDoc(text) {\n  var head = text.split('\\n').slice(0, 160).join('\\n');\n  var scores = { primary: 1 }, i, s;\n  for (i = 0; i < CLASS_SIGNALS.length; i++) {\n    s = CLASS_SIGNALS[i];\n    if (s.re.test(head) || (s.w >= 7 && s.re.test(text.slice(0, 20000)))) {\n      scores[s.cls] = (scores[s.cls] || 0) + s.w;\n    }\n  }\n  var best = 'primary', bv = 0;\n  for (var k in scores) if (scores[k] > bv) { bv = scores[k]; best = k; }\n  return { doc_class: best, scores: scores };\n}\n\n/* ---------- Stage 2b: jurisdiction dialect ---------- */\n\nvar DIALECT_SIGNALS = [\n  { d: 'HK', w: 6, re: /\\((?:Amended|Added|Replaced)\\s+\\d+\\s+of\\s+\\d{4}/ },\n  { d: 'HK', w: 4, re: /\\bCap\\.\\s*\\d+[A-Z]?\\b|\\bL\\.N\\.\\s*\\d+\\s+of\\s+\\d{4}/ },\n  { d: 'HK', w: 3, re: /[\\u4e00-\\u9fff]{4,}/ },\n  { d: 'UK', w: 5, re: /\\[F\\d+|Textual Amendments|Modifications etc\\./ },\n  { d: 'UK', w: 4, re: /\\bHer Majesty|His Majesty|King's most Excellent Majesty|Queen's most Excellent Majesty\\b/ },\n  { d: 'UK', w: 3, re: /\\bStatutory Instruments?\\b|\\bSI\\s+\\d{4}\\/\\d+\\b/ },\n  { d: 'IE', w: 6, re: /F\\d+\\[|\\]F\\d+|\\bOireachtas\\b|\\bS\\.I\\.\\s*No\\.\\s*\\d+\\s*of\\s*\\d{4}/i },\n  { d: 'IE', w: 4, re: /^\\s*Number\\s+\\d+\\s+of\\s+\\d{4}\\s*$/m },\n  { d: 'AU', w: 6, re: /\\bCompilation No\\.|\\bFederal Register of Legislation\\b|\\bpenalty units\\b/i },\n  { d: 'AU', w: 4, re: /^\\s*Note\\s*\\d*\\s*:/m },\n  { d: 'IN', w: 6, re: /\\bGazette of India\\b|\\bIndia Code\\b/i },\n  { d: 'IN', w: 6, re: /\\[\\s*PART\\s+[IVX]+\\s*[\\u2014-]\\s*SEC\\.|MINISTRY OF (?:ENVIRONMENT|LAW|FINANCE|HOME AFFAIRS)|\\bNew Delhi, the\\b/i },\n  { d: 'IN', w: 5, re: /^\\s*\\d+\\.\\s+[A-Z][^\\n]{3,80}\\.\\s*[\\u2014-]{1,2}\\s*\\(1\\)/m },\n  { d: 'IN', w: 5, re: /\\bExplanation\\s*\\d*\\s*[.\\u2014]|^\\s*Illustrations?\\s*$/im },\n  { d: 'IN', w: 4, re: /\\b(?:Central Pollution Control Board|State Pollution Control Board|Central Government|Adhiniyam|Sanhita)\\b/ },\n  { d: 'NG', w: 6, re: /\\bLaws of the Federation of Nigeria\\b|\\bNational Assembly of the Federal Republic of Nigeria\\b|\\bCap\\.\\s*[A-Z]\\d+\\b/i },\n  { d: 'ZA', w: 6, re: /\\bGOVERNMENT GAZETTE\\b|\\bStaatskoerant\\b|\\[\\s*(?:Sub-)?s\\.?\\s*\\d[^\\]]*substituted by/i },\n  { d: 'ZA', w: 4, re: /unless the context otherwise indicates\\s*\\u2014|\\bRepublic of South Africa\\b/i },\n  { d: 'AE', w: 7, re: /\\bFederal Decree-Law\\b|\\bUnofficial translation\\b|\\boriginal Arabic text\\b|\\bUnited Arab Emirates\\b/i },\n  { d: 'AE', w: 5, re: new RegExp('^\\\\s*(?:Chapter|Part|Section)\\\\s+(?:' + ORD_WORD_RE + ')\\\\b', 'im') },\n  { d: 'AE', w: 4, re: /\\bDIFC\\b|\\bADGM\\b|\\bAbu Dhabi Global Market\\b|\\bDubai International Financial Centre\\b/ }\n];\n\nfunction classifyDialect(text) {\n  var probe = text.slice(0, 40000), scores = {}, i;\n  for (i = 0; i < DIALECT_SIGNALS.length; i++) {\n    if (DIALECT_SIGNALS[i].re.test(probe)) {\n      scores[DIALECT_SIGNALS[i].d] = (scores[DIALECT_SIGNALS[i].d] || 0) + DIALECT_SIGNALS[i].w;\n    }\n  }\n  var best = null, bv = 0;\n  for (var k in scores) if (scores[k] > bv) { bv = scores[k]; best = k; }\n  return { dialect: best, scores: scores };\n}\n\n/* Vol. I 3.1: for subsidiary legislation the leaf unit is set by the instrument\n   title, not the jurisdiction. Regulations -> regulation, Order -> article,\n   Rules -> rule. */\nfunction detectLeafUnit(text, doc_class) {\n  var head = text.split('\\n').slice(0, 60).join('\\n');\n  var m = head.match(/^[^\\n]*\\b(REGULATIONS|RULES|ORDER)\\s+(?:19|20)\\d{2}\\b/m);\n  if (!m) m = head.match(/\\b(Regulations|Rules|Order)\\s+(?:19|20)\\d{2}\\s*$/m);\n  if (!m) m = head.match(/\\b(Regulations|Rules|Order)\\s+(?:19|20)\\d{2}\\b/);\n  if (!m) return null;\n  var w = m[1].toLowerCase();\n  if (w === 'regulations') return 'Regulation';\n  if (w === 'rules') return 'Rule';\n  if (w === 'order') return 'Article';\n  return null;\n}\n\n/* class + dialect -> family */\nfunction pickFamily(doc_class, dialect, text) {\n  if (doc_class === 'standard')    return 'en_standards_clause';\n  if (doc_class === 'judgment')    return 'en_judgment';\n  if (doc_class === 'regulatory')  return 'en_regulatory';\n  if (doc_class === 'court_rules') return 'en_order_rule';\n  if (doc_class === 'constitution') return 'en_constitution';\n  if (dialect === 'AE') return 'en_gulf_article';\n  if (dialect === 'ZA') return 'en_sa_gazette';\n  if (dialect === 'IN' || dialect === 'NG') return 'en_commonwealth_legacy';\n  if (dialect === 'UK' || dialect === 'IE' || dialect === 'AU' || dialect === 'HK') return 'en_westminster';\n  /* structural fallback — Vol. I 4: tie-break to en_westminster, the safe superset */\n  var arts = (text.match(/^\\s*Article\\s*[\\(\\d]/gim) || []).length;\n  var secs = (text.match(/^\\s*\\d{1,4}[A-Z]{0,3}\\.?\\s+[A-Z]/gm) || []).length;\n  var groups = (text.match(/^\\s*(?:PART|CHAPTER|SCHEDULE|Division)\\b/gim) || []).length;\n  if (arts >= 3 && arts > secs) return 'en_gulf_article';\n  if (secs >= 3 || (secs >= 1 && groups >= 1)) return 'en_westminster';\n  if (doc_class === 'primary' || doc_class === 'subsidiary') return 'en_westminster';\n  return 'generic';\n}\n\n/* ---------- Stage 2c: dialect strippers ---------- */\n\nfunction applyStrippers(text, dialect, doc_class) {\n  var lines = text.split('\\n'), i, l;\n  for (i = 0; i < lines.length; i++) {\n    l = lines[i];\n    if (dialect === 'HK') { l = l.replace(STRIPPERS.hk_flag, '').replace(STRIPPERS.hk_source, ''); }\n    if (dialect === 'UK') { l = l.replace(STRIPPERS.uk_fmark, ''); }\n    if (dialect === 'IE') { l = l.replace(STRIPPERS.ie_fmark, ''); }\n    if (dialect === 'ZA') { l = l.replace(STRIPPERS.za_edit, ''); }\n    if (dialect === 'IN' || dialect === 'NG' || doc_class === 'regulatory') {\n      l = l.replace(STRIPPERS.in_bracket_open, '$1').replace(/\\]/g, function (m, off, s) {\n        return /\\[/.test(s.slice(0, off)) ? '' : m;\n      });\n      l = l.replace(STRIPPERS.in_omitted, '');\n    }\n    lines[i] = l.replace(/\\s{2,}/g, ' ').replace(/\\s+$/, '');\n  }\n  return lines.join('\\n');\n}\n\n/* ---------- Stage 2d: marker ladders ---------- */\n\nvar FAMILIES = {\n\n  en_westminster: {\n    leafLabel: 'section',\n    markers: [\n      { re: /^\\s*(?:THE\\s+)?(SCHEDULES?|ANNEXURES?|ANNEXES?)\\b\\s*(\\d+|[IVXLCDM]+|[A-Z])?\\s*[.\\u2014:-]?\\s*(.*)$/i,\n        depth: 0, label: 'schedule', zone: 'schedule', cap: 'SCHEDULE', wordFirst: true, strictHeading: true },\n      { re: /^\\s*PART\\s+([IVXLCDM]+|\\d+(?:[\\u2014-]\\d+)?[A-Z]?)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 1, label: 'part' },\n      { re: /^\\s*CHAPTER\\s+([IVXLCDM]+|\\d+(?:[\\u2014-]\\d+)?[A-Z]?)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 2, label: 'chapter' },\n      { re: /^\\s*(?:Sub)?[Dd]ivision\\s+(\\d+(?:[\\u2014-]\\d+)?[A-Z]?|[A-Z])\\b\\s*[.\\u2014:-]?\\s*(.*)$/, depth: 3, label: 'division' },\n      /* 2.—(1) In this Act …   (older UK / Irish inline form) */\n      { re: /^\\s*(\\d{1,4}[A-Z]{0,3})\\.\\s*[\\u2014-]{0,2}\\s*(\\(\\d+[A-Z]?\\).*)$/, depth: 4, label: 'section', leaf: true, inlineBody: true },\n      /* 12  Heading of the section   |   12. Heading of the section */\n      { re: new RegExp('^\\\\s*(\\\\d{1,4}[A-Z]{0,3}(?:[\\\\u2014-]\\\\d{1,3})?)\\\\.?\\\\s+(?!' + UNIT_TAIL + ')([A-Z(\\\\u201C\"].*)$'), depth: 4, label: 'section', leaf: true }\n    ]\n  },\n\n  en_commonwealth_legacy: {\n    leafLabel: 'section',\n    markers: [\n      { re: /^\\s*(?:THE\\s+)?(SCHEDULES?|ANNEXURES?)\\b\\s*(\\d+|[IVXLCDM]+|[A-Z]|First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh|Twelfth)?\\s*[.\\u2014:-]?\\s*(.*)$/i,\n        depth: 0, label: 'schedule', zone: 'schedule', cap: 'SCHEDULE', wordFirst: true, strictHeading: true },\n      { re: /^\\s*PART\\s+([IVXLCDM]+|\\d+(?:[\\u2014-]\\d+)?[A-Z]?)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 1, label: 'part' },\n      { re: /^\\s*CHAPTER\\s+([IVXLCDM]+|\\d+(?:[\\u2014-]\\d+)?[A-Z]?)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 2, label: 'chapter' },\n      /* 1. Short title, extent and commencement.—(1) This Act … */\n      { re: /^\\s*(\\d{1,4}[A-Z]{0,3})\\.\\s*(.{2,320}?)\\.\\s*[\\u2014-]{1,2}\\s*(.*)$/, depth: 4, label: 'section', leaf: true, runIn: true },\n      { re: /^\\s*(\\d{1,4}[A-Z]{0,3})\\.\\s*[\\u2014-]{1,2}\\s*(\\(\\d+[A-Z]?\\).*)$/, depth: 4, label: 'section', leaf: true, inlineBody: true },\n      { re: /^\\s*(\\d{1,4}[A-Z]{0,3})\\.?\\s+([A-Z(\\u201C\"].*)$/, depth: 4, label: 'section', leaf: true }\n    ]\n  },\n\n  en_sa_gazette: {\n    leafLabel: 'section',\n    markers: [\n      { re: /^\\s*(?:THE\\s+)?(SCHEDULES?|ANNEXURES?)\\b\\s*(\\d+|[IVXLCDM]+|[A-Z])?\\s*[.\\u2014:-]?\\s*(.*)$/i,\n        depth: 0, label: 'schedule', zone: 'schedule', cap: 'SCHEDULE', wordFirst: true, strictHeading: true },\n      { re: /^\\s*CHAPTER\\s+([IVXLCDM]+|\\d+(?:[\\u2014-]\\d+)?[A-Z]?)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 1, label: 'chapter' },\n      { re: /^\\s*PART\\s+([IVXLCDM]+|\\d+(?:[\\u2014-]\\d+)?[A-Z]?)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 2, label: 'part' },\n      { re: /^\\s*(\\d{1,4}[A-Z]{0,3})\\.\\s*(.{2,320}?)\\.\\s*[\\u2014-]{1,2}\\s*(.*)$/, depth: 4, label: 'section', leaf: true, runIn: true },\n      { re: /^\\s*(\\d{1,4}[A-Z]{0,3})\\.\\s*[\\u2014-]{0,2}\\s*(\\(\\d+[A-Z]?\\).*)$/, depth: 4, label: 'section', leaf: true, inlineBody: true },\n      { re: /^\\s*(\\d{1,4}[A-Z]{0,3})\\.?\\s+([A-Z(\\u201C\"].*)$/, depth: 4, label: 'section', leaf: true }\n    ]\n  },\n\n  en_gulf_article: {\n    leafLabel: 'Article',\n    markers: [\n      { re: new RegExp('^\\\\s*(Book|Title)\\\\s+(?:\\\\(?(\\\\d+)\\\\)?|(' + ORD_WORD_RE + '))\\\\b\\\\s*[:.\\\\u2014-]?\\\\s*(.*)$', 'i'), depth: 0, label: 'book' },\n      { re: new RegExp('^\\\\s*Part\\\\s+(?:\\\\(?(\\\\d+)\\\\)?|(' + ORD_WORD_RE + '))\\\\b\\\\s*[:.\\\\u2014-]?\\\\s*(.*)$', 'i'), depth: 1, label: 'part' },\n      { re: new RegExp('^\\\\s*Chapter\\\\s+(?:\\\\(?(\\\\d+)\\\\)?|(' + ORD_WORD_RE + '))\\\\b\\\\s*[:.\\\\u2014-]?\\\\s*(.*)$', 'i'), depth: 2, label: 'chapter' },\n      { re: new RegExp('^\\\\s*Section\\\\s+(?:\\\\(?(\\\\d+)\\\\)?|(' + ORD_WORD_RE + '))\\\\b\\\\s*[:.\\\\u2014-]?\\\\s*(.*)$', 'i'), depth: 3, label: 'section' },\n      { re: /^\\s*Article\\s*[\\(\\[]?\\s*(\\d{1,4}[A-Za-z]{0,3})\\s*[\\)\\]]?\\s*(bis|repeated|mukarrar)?\\s*[:.\\u2014-]?\\s*(.*)$/i,\n        depth: 4, label: 'Article', leaf: true, gulfArticle: true },\n      { re: /^\\s*(?:ANNEX|APPENDIX|SCHEDULE)\\s*[\\(\\[]?\\s*(\\d+|[IVXLCDM]+|[A-Z])?\\s*[\\)\\]]?\\s*[:.\\u2014-]?\\s*(.*)$/i,\n        depth: 0, label: 'annex', zone: 'schedule', cap: 'ANNEX', wordFirst: true, strictHeading: true }\n    ]\n  },\n\n  en_constitution: {\n    leafLabel: 'Article',\n    markers: [\n      { re: /^\\s*(?:THE\\s+)?(SCHEDULES?)\\b\\s*(\\d+|[IVXLCDM]+|First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh|Twelfth)?\\s*[.\\u2014:-]?\\s*(.*)$/i,\n        depth: 0, label: 'schedule', zone: 'schedule', cap: 'SCHEDULE', wordFirst: true, strictHeading: true },\n      { re: /^\\s*PART\\s+([IVXLCDM]+|\\d+(?:[\\u2014-]\\d+)?[A-Z]?)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 1, label: 'part' },\n      { re: /^\\s*CHAPTER\\s+([IVXLCDM]+|\\d+(?:[\\u2014-]\\d+)?[A-Z]?)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 2, label: 'chapter' },\n      { re: /^\\s*Article\\s+(\\d{1,4}[A-Z]{0,3})\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 4, label: 'Article', leaf: true },\n      { re: /^\\s*(\\d{1,4}[A-Z]{0,3})\\.\\s*[\\u2014-]{0,2}\\s*(\\(\\d+\\).*)$/, depth: 4, label: 'section', leaf: true, inlineBody: true },\n      { re: /^\\s*(\\d{1,4}[A-Z]{0,3})\\.?\\s+([A-Z(\\u201C\"].*)$/, depth: 4, label: 'section', leaf: true }\n    ]\n  },\n\n  en_regulatory: {\n    leafLabel: 'paragraph',\n    markers: [\n      { re: /^\\s*(?:ANNEXURE|ANNEX|ATTACHMENT|APPENDIX|SCHEDULE)\\s*[\\u2014:-]?\\s*([A-Z0-9IVX]{1,4})?\\b\\s*[.\\u2014:-]?\\s*(.*)$/i,\n        depth: 0, label: 'annex', zone: 'schedule', cap: 'ANNEX', wordFirst: true, strictHeading: true },\n      { re: /^\\s*CHAPTER\\s+([IVXLCDM]+|\\d+(?:[\\u2014-]\\d+)?[A-Z]?)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 1, label: 'chapter' },\n      { re: /^\\s*(?:PART|MODULE|SECTION)\\s+([IVXLCDM]+|\\d+[A-Z]?)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 2, label: 'part' },\n      /* GEN 2.2.3 R  —  module path with status letter */\n      { re: /^\\s*([A-Z]{2,6})\\s+(\\d+[A-Z]?(?:\\.\\d+[A-Z]?){1,4})\\s*(R|E|G|D|P|C|UK|EU)?\\b\\s*(.*)$/,\n        depth: 4, label: 'paragraph', leaf: true, mode: 'module' },\n      /* 1.9  |  87.2.2 */\n      { re: /^\\s*(\\d{1,3}(?:\\.\\d{1,3}){1,4})\\.?\\s+(\\S.*)$/, depth: 4, label: 'paragraph', leaf: true, mode: 'dotted' },\n      /* RG 104.15 */\n      { re: /^\\s*([A-Z]{2,4})\\s+(\\d{1,4})\\.(\\d{1,4})\\s+(\\S.*)$/, depth: 4, label: 'paragraph', leaf: true, mode: 'code' },\n      /* flat: 53. */\n      { re: /^\\s*(\\d{1,3})\\.\\s+([A-Z(].*)$/, depth: 4, label: 'paragraph', leaf: true, mode: 'flat' }\n    ]\n  },\n\n  en_order_rule: {\n    leafLabel: 'rule',\n    markers: [\n      { re: /^\\s*(?:THE\\s+)?(SCHEDULES?|APPENDIX|APPENDICES|FORMS?)\\b\\s*(\\d+|[IVXLCDM]+|[A-Z])?\\s*[.\\u2014:-]?\\s*(.*)$/i,\n        depth: 0, label: 'schedule', zone: 'schedule', cap: 'SCHEDULE', wordFirst: true, strictHeading: true },\n      { re: /^\\s*ORDER\\s+([IVXLCDM]+|\\d+[A-Z]?)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 1, label: 'Order', container: true },\n      { re: /^\\s*PART\\s+(\\d+[A-Z]?|[IVXLCDM]+)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 1, label: 'Part' },\n      { re: /^\\s*(?:Division|Chapter)\\s+(\\d+[A-Z]?|[IVXLCDM]+)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i, depth: 2, label: 'division' },\n      /* CPR / Federal Court style: 3.1  |  8.21 */\n      { re: /^\\s*(\\d{1,3}\\.\\d{1,3}[A-Z]?)\\.?\\s+(\\S.*)$/, depth: 4, label: 'rule', leaf: true, mode: 'part_rule' },\n      /* rule inside an Order: 11. */\n      { re: /^\\s*(\\d{1,3}[A-Z]?)\\.\\s+([A-Z(\\u201C\"].*)$/, depth: 4, label: 'rule', leaf: true, mode: 'order_rule' }\n    ]\n  },\n\n  en_standards_clause: {\n    leafLabel: 'clause',\n    rollup: true,\n    markers: [\n      { re: /^\\s*(Bibliography|Index)\\s*$/i, depth: 0, label: 'backmatter', zone: 'back', cap: 'BACK' },\n      { re: /^\\s*Annex\\s+([A-Z]{1,2})\\b\\s*(?:\\(\\s*(normative|informative)\\s*\\))?\\s*[.\\u2014:-]?\\s*(.*)$/i,\n        depth: 0, label: 'annex', zone: 'annex', cap: 'ANNEX' },\n      { re: /^\\s*([A-Z]{1,2}(?:\\.\\d{1,3}){1,4})\\.?\\s*(.*)$/, depth: 3, label: 'annexclause', leaf: true, annexOnly: true },\n      { re: /^\\s*([1-9]\\d?(?:\\.\\d{1,3}){1,4})\\.?\\s*(.*)$/, depth: 3, label: 'subclause', leaf: true },\n      { re: new RegExp('^\\\\s*(\\\\d{1,2})\\\\.?\\\\s+(?!' + UNIT_TAIL + ')([A-Z\\\\u201C\"].*)$'), depth: 2, label: 'clause', leaf: true },\n      { re: /^\\s*(Foreword|Introduction|Scope)\\s*$/i, depth: 2, label: 'frontclause', leaf: true, noMarker: true }\n    ]\n  },\n\n  en_judgment: {\n    leafLabel: 'paragraph',\n    markers: [\n      { re: /^\\s*((?:LORD|LADY|MR|MRS|MS|SIR)\\s+[A-Z][A-Za-z' .-]{2,40}|[A-Z][A-Za-z'-]{2,20}\\s+(?:JJA|JA|CJ|LJ|J|P|AJ))\\s*:?\\s*$/,\n        depth: 1, label: 'judge', container: true },\n      { re: /^\\s*\\[(\\d{1,4})\\]\\s*(.*)$/, depth: 4, label: 'paragraph', leaf: true },\n      { re: /^\\s*(\\d{1,4})\\.\\s+([A-Z\\u201C\"].*)$/, depth: 4, label: 'paragraph', leaf: true, mode: 'plain' }\n    ]\n  },\n\n  generic: {\n    leafLabel: 'block',\n    markers: [\n      { re: /^\\s*(?:ARTICLE|SECTION|CLAUSE|RULE|REGULATION|PARAGRAPH)\\s+(\\d{1,4}[A-Z]{0,3}(?:\\.\\d{1,3})*)\\b\\s*[.\\u2014:-]?\\s*(.*)$/i,\n        depth: 4, label: 'block', leaf: true },\n      { re: /^\\s*(\\d{1,4}(?:\\.\\d{1,3}){0,3})\\.?\\s+([A-Z].*)$/, depth: 4, label: 'block', leaf: true }\n    ]\n  }\n};\n\n/* Reject a candidate leaf whose \"title\" is really a measurement, a date,\n   or a continuation of prose. */\nvar UNIT_RE  = new RegExp('^\\\\d[\\\\d.,\\\\s\\u00D7xX]*' + UNIT_TAIL, 'i');\nvar BARE_UNIT_RE = /^(?:mm|cm|km|kg|kV|kA|kW|MW|MPa|kPa|Hz|MHz|GHz|%|\\u00B0C|\\u2103)\\b/i;\nvar DATE_RE  = /^(?:January|February|March|April|May|June|July|August|September|October|November|December)\\b/i;\n/* A schedule/annex heading stands alone on its line; a cross-reference does not. */\nfunction isStandaloneHeading(line) {\n  var t = line.trim();\n  if (t.length > 90) return false;\n  if (/[,;]$/.test(t)) return false;\n  var kw = t.match(/^(?:THE\\s+)?([A-Za-z]+)/);\n  if (!kw) return false;\n  if (kw[1] === kw[1].toUpperCase()) return true;          // SCHEDULE 1\n  return /^(?:THE\\s+)?[A-Za-z]+\\s*(?:\\d+|[IVXLCDM]+|[A-Z])?\\s*[:.\\u2014-]?\\s*$/.test(t);\n}\n\nfunction looksLikeNoiseTitle(title) {\n  if (!title) return false;\n  var t = title.trim();\n  if (UNIT_RE.test(t) || BARE_UNIT_RE.test(t)) return true;\n  if (DATE_RE.test(t)) return true;\n  if (/^(?:of|to|in|on|at|by|for|and|or|the|a|an)\\b/.test(t)) return true;   // mid-sentence\n  return false;\n}\n\n/* Pass 1 — text -> structural blocks. */\nfunction toBlocks(text, family, opts) {\n  opts = opts || {};\n  var leafUnit = opts.leafUnit || null;\n  var cfg = FAMILIES[family] || FAMILIES.generic;\n  var lines = text.split('\\n');\n  var blocks = [], cur = null, zone = 'body', zoneKey = '', zoneSeq = 0;\n  var stack = {}, frontDone = !opts.skipFrontMatter, i, j;\n  var inIllustration = false, sawArticle = false;\n\n  function push(b) { blocks.push(b); cur = b; }\n\n  function ctxSnapshot() {\n    var c = {};\n    for (var k in stack) if (stack[k]) c[k] = stack[k];\n    return c;\n  }\n\n  for (i = 0; i < lines.length; i++) {\n    var raw = lines[i], line = raw.trim();\n    if (!line) { if (cur) cur.lines.push(''); continue; }\n\n    /* front matter: swallow until the first real marker */\n    if (!frontDone) {\n      if (RE_LONG_TITLE.test(line) || RE_ENACTING.test(line) || RE_PREAMBLE.test(line)) continue;\n    }\n\n    /* illustrations: (a) inside them is not a paragraph ladder */\n    if (RE_ILLUSTR.test(line)) { inIllustration = true; if (cur) cur.lines.push(line); continue; }\n    if (inIllustration && (RE_SUBSEC.test(line) || /^\\s*\\d{1,3}\\./.test(line))) inIllustration = false;\n\n    var matched = null, mk = null, gm = null;\n    for (j = 0; j < cfg.markers.length; j++) {\n      mk = cfg.markers[j];\n      if (mk.annexOnly && zone !== 'annex') continue;\n      if (inIllustration && mk.leaf) continue;\n      if (sawArticle && mk.leaf && mk.label === 'section') continue;\n      gm = line.match(mk.re);\n      if (gm && mk.runIn && /\\(\\d{1,3}[A-Z]{0,2}\\)/.test(gm[2] || '')) { gm = null; continue; }\n      if (gm) { matched = mk; break; }\n    }\n\n    if (matched) {\n      var g = gm.filter(function (x, idx) { return idx > 0; });\n      var markerTok = null, title = '', body = '', suffix = '';\n\n      if (matched.gulfArticle) {\n        markerTok = gm[1]; suffix = gm[2] || ''; body = gm[3] || '';\n      } else if (matched.runIn) {\n        markerTok = gm[1]; title = gm[2] || ''; body = gm[3] || '';\n      } else if (matched.mode === 'module') {\n        markerTok = gm[1] + ' ' + gm[2]; suffix = gm[3] || ''; body = gm[4] || '';\n      } else if (matched.mode === 'code') {\n        markerTok = gm[1] + ' ' + gm[2] + '.' + gm[3]; body = gm[4] || '';\n      } else if (matched.wordFirst) {\n        markerTok = (gm[2] || '').trim(); title = (gm[3] || '').trim();\n        if (!markerTok) markerTok = String(zoneSeq + 1);\n      } else if (matched.inlineBody) {\n        markerTok = gm[1]; body = gm[2] || '';\n      } else if (matched.noMarker) {\n        markerTok = gm[1]; title = gm[1];\n      } else if (matched.label === 'annex' && cfg.rollup) {\n        markerTok = gm[1]; suffix = gm[2] || ''; title = gm[3] || '';\n      } else {\n        /* generic: first defined capture = marker, remainder = title/body */\n        markerTok = gm[1] != null ? gm[1] : (gm[2] != null ? gm[2] : '');\n        if (gm[2] != null && gm[1] == null) markerTok = gm[2];\n        var tail = g.slice(g.indexOf(markerTok) + 1).filter(Boolean);\n        title = tail.length ? tail[tail.length - 1] : '';\n      }\n\n      if (matched.strictHeading && !isStandaloneHeading(line)) {\n        if (cur) cur.lines.push(line);\n        continue;\n      }\n\n      if (matched.leaf && looksLikeNoiseTitle(title || body)) {\n        if (cur) cur.lines.push(line);\n        continue;\n      }\n\n      frontDone = true;\n      if (matched.leaf && matched.label === 'Article') sawArticle = true;\n\n      /* \"36. In this Part, ... —\" : that is body, not a heading */\n      if (matched.leaf && title && !matched.runIn && !matched.mode &&\n          (title.length > 70 || /[.;:,\\u2014-]$/.test(title.trim()) ||\n           /\\(\\d+[A-Z]?\\)/.test(title))) {\n        body = title; title = '';\n      }\n\n      /* heading-above: \"Citation, commencement and revocation\" / \"1. (1) These ...\" */\n      if (matched.leaf && !title && cur && cur.lines.length && opts.headingAbove !== false) {\n        var prev = cur.lines[cur.lines.length - 1];\n        if (prev && prev.length <= 110 && /^[A-Z\\u201C\"(]/.test(prev) &&\n            !/[.;:,]$/.test(prev) && !/^\\(/.test(prev) && /[a-z]/.test(prev)) {\n          title = prev; cur.lines.pop();\n          while (cur.lines.length && !cur.lines[cur.lines.length - 1]) cur.lines.pop();\n        }\n      }\n\n      if (matched.zone) {\n        zone = matched.zone;\n        zoneSeq++;\n        zoneKey = (matched.cap || 'ZONE') + ' ' + (markerTok || zoneSeq);\n      }\n\n      /* clear deeper context */\n      for (var k in stack) if (Number(k) >= matched.depth) delete stack[k];\n      if (!matched.leaf) {\n        stack[matched.depth] = { label: matched.label, marker: markerTok, title: title };\n      }\n\n      push({\n        kind: matched.leaf ? 'leaf' : 'container',\n        label: matched.label,\n        depth: matched.depth,\n        marker: markerTok == null ? '' : String(markerTok).trim(),\n        suffix: (suffix || '').trim(),\n        title: (title || '').trim(),\n        mode: matched.mode || null,\n        zone: zone,\n        zoneKey: zoneKey,\n        ctx: ctxSnapshot(),\n        leafUnit: (matched.leaf && leafUnit) ? leafUnit : null,\n        lines: body ? [body.trim()] : []\n      });\n      continue;\n    }\n\n    /* not a marker -> content of the current block */\n    if (!cur) {\n      push({ kind: 'leaf', label: 'preamble', depth: 9, marker: '', suffix: '', title: '',\n             zone: zone, zoneKey: zoneKey, ctx: {}, lines: [], preamble: true });\n    }\n    cur.lines.push(line);\n  }\n\n  /* tag special content lines for downstream consumers */\n  for (i = 0; i < blocks.length; i++) {\n    var b = blocks[i], tags = {};\n    for (j = 0; j < b.lines.length; j++) {\n      var L = b.lines[j];\n      if (RE_PROVISO.test(L)) tags.proviso = true;\n      if (RE_EXPLANATION.test(L)) tags.explanation = true;\n      if (RE_ILLUSTR.test(L)) tags.illustration = true;\n      if (RE_NOTE_AU.test(L)) tags.note = true;\n      if (RE_PENALTY_AU.test(L)) tags.penalty = true;\n      if (RE_IE_DEG.test(L)) tags.degree = true;\n      if (RE_REPEALED.test(L)) tags.repealed = true;\n    }\n    b.tags = tags;\n  }\n  return blocks;\n}\n\n/* ============ STAGE 3 · render rows ============ */\n\n/* Pass 2 — blocks -> { article, contenu } rows. */\n\nvar LEAF_PREFIX = {\n  section: 'Section', Article: 'Article', clause: 'Clause', subclause: 'Clause',\n  annexclause: '', rule: 'Rule', paragraph: '', block: ''\n};\n\n/* Enumeration openers - any of these starts a new contenu paragraph. */\nvar ENUM_RES = [\n  /^\\s*\\((\\d{1,3}[A-Z]{0,2}|[a-z]{1,3}|[ivxlcdm]{1,8}|[A-Z]{1,3})\\)\\s*\\S/,\n  /^\\s*([a-z]{1,2})\\)\\s*\\S/,                    // ISO list style  a) b)\n  /^\\s*(\\d{1,3})\\.\\s+\\S/,                       // Gulf clause     1.\n  /^\\s*([a-z])\\.\\s+\\S/,                          // Gulf item       a.\n  /^\\s*(\\d{1,2})\\s*[\\u00B0\\u00BA]\\s*\\S/,        // Irish constitution 1deg\n  /^\\s*[\"\\u201C][^\"\\u201D\\n]{1,90}[\"\\u201D]\\s*(?:,|\\(|means\\b|has the meaning|includes\\b|shall\\b)/,  // \"term\" means ...\n  /^\\s*(?:Provided\\s+(?:that|further|also)|Explanation\\s*\\d*\\s*[.:\\u2014-]|Note\\s*\\d*\\s*:|Penalty\\s*:)/i,\n  /^\\s*\\|/                                       // markdown table row\n];\nfunction startsEnum(line) {\n  for (var i = 0; i < ENUM_RES.length; i++) if (ENUM_RES[i].test(line)) return true;\n  return false;\n}\n\n/* Split a leaf's text into rows: one per enumerated item or prose paragraph. */\nfunction explodeParagraphs(lines) {\n  var out = [], cur = [], i, L;\n  for (i = 0; i < lines.length; i++) {\n    L = lines[i];\n    if (!L.trim()) { if (cur.length) { out.push(cur.join('\\n')); cur = []; } continue; }\n    if (startsEnum(L) && cur.length) { out.push(cur.join('\\n')); cur = []; }\n    cur.push(L);\n  }\n  if (cur.length) out.push(cur.join('\\n'));\n  return out.filter(function (x) { return x.trim(); });\n}\n\nfunction withTitle(label, b, opts) {\n  if (!opts || opts.articleStyle !== 'source') return label;\n  return b.title ? label + ' ' + b.title : label;\n}\n\nfunction articleLabel(b, family, opts) {\n  var lbl = b.label, m = b.marker;\n  var inSched = b.zone === 'schedule' || b.zone === 'annex';\n  var prefix = inSched && b.zoneKey && lbl !== 'schedule' && lbl !== 'annex'\n             ? titleCase(b.zoneKey) + ', ' : '';\n\n  /* ---- grouping levels: family-independent ---- */\n  if (lbl === 'schedule' || lbl === 'annex') return titleCase(b.zoneKey || (lbl + ' ' + m));\n  if (lbl === 'backmatter') return titleCase(m || 'Bibliography');\n  if (lbl === 'part'  || lbl === 'Part')  return 'Part ' + m;\n  if (lbl === 'chapter')  return 'Chapter ' + m;\n  if (lbl === 'book')     return 'Book ' + m;\n  if (lbl === 'division') return 'Division ' + m;\n  if (lbl === 'Order')    return 'Order ' + m;\n  if (lbl === 'judge')    return m;\n\n  /* ---- leaves: family-specific ---- */\n  if (family === 'en_judgment') return '[' + m + ']';\n\n  if (family === 'en_standards_clause') {\n    if (lbl === 'annexclause') return withTitle((b.zoneKey ? titleCase(b.zoneKey) + ', ' : '') + m, b, opts);\n    if (lbl === 'frontclause') return m;\n    return withTitle((opts && opts.articleStyle === 'source') ? m : 'Clause ' + m, b, opts);\n  }\n\n  if (family === 'en_regulatory') {\n    if (b.mode === 'module' || b.mode === 'code') return withTitle(m + (b.suffix ? ' ' + b.suffix : ''), b, opts);\n    return withTitle(prefix + ((opts && opts.articleStyle === 'source') ? m : 'Paragraph ' + m), b, opts);\n  }\n\n  if (family === 'en_order_rule') {\n    if (b.ctx && b.ctx[1] && b.ctx[1].label === 'Order') return withTitle('Order ' + b.ctx[1].marker + ', Rule ' + m, b, opts);\n    return withTitle(prefix + 'Rule ' + m, b, opts);\n  }\n\n  /* leaf inside a schedule is a paragraph of that schedule (Vol. I 5.7) */\n  if (inSched && (lbl === 'section' || lbl === 'Article')) {\n    if (opts && opts.articleStyle === 'source') return withTitle(prefix + m, b, opts);\n    return prefix + ((opts && opts.scheduleLeaf) || 'paragraph') + ' ' + m;\n  }\n\n  var p = (opts && opts.articleStyle === 'source') ? ''\n        : (b.leafUnit ? b.leafUnit\n          : (LEAF_PREFIX[lbl] != null ? LEAF_PREFIX[lbl] : titleCase(lbl)));\n  var suf = b.suffix ? ' ' + b.suffix : '';\n  return withTitle(prefix + (p ? p + ' ' : '') + m + suf, b, opts);\n}\n\nfunction titleCase(s) {\n  return String(s).toLowerCase().replace(/\\b([a-z])/g, function (m0, c) { return c.toUpperCase(); });\n}\n\n/* Standards roll-up, ported from cn_standards with segment namespacing:\n   article level = max(1, deepestLevelInGroup - 1). */\nfunction rollupStandards(blocks) {\n  var i, b, parts, top, seg = 0, high = 0, meta = [], maxDepth = {}, isDef = {};\n\n  /* pass A - segment id + deepest level reached under each top-level clause */\n  for (i = 0; i < blocks.length; i++) {\n    b = blocks[i];\n    if (b.label !== 'subclause' && b.label !== 'clause' && b.label !== 'annexclause') { meta.push(null); continue; }\n    parts = String(b.marker).split('.');\n    top = markerValue(parts[0]);\n    if (parts.length >= 2 && !isNaN(top)) {\n      if (top < high) { seg++; high = top; } else high = Math.max(high, top);\n    }\n    var tkey = seg + '|' + parts[0];\n    maxDepth[tkey] = Math.max(maxDepth[tkey] || 1, parts.length);\n    if (parts.length === 1 && /terms and definitions|definitions/i.test(b.title || '')) isDef[tkey] = true;\n    meta.push({ seg: seg, parts: parts, tkey: tkey });\n  }\n\n  /* pass B - group by the first `level` marker components */\n  var groups = [], index = {};\n  for (i = 0; i < blocks.length; i++) {\n    b = blocks[i];\n    var m = meta[i];\n    if (!m) { groups.push({ solo: b }); continue; }\n    var level = Math.max(1, (maxDepth[m.tkey] || 1) - 1);\n    if (isDef[m.tkey]) level = Math.max(level, 2);\n    var key = m.seg + '|' + m.parts.slice(0, level).join('.');\n    if (m.parts.length < level) key = m.seg + '|' + m.parts.join('.') + '|solo';\n    if (!index[key]) { index[key] = { head: b, members: [], key: key }; groups.push(index[key]); }\n    index[key].members.push(b);\n  }\n  return groups;\n}\n\nfunction blockText(b, opts) {\n  var lines = b.lines.slice();\n  if (opts && opts.includeHeadingInContenu && b.title) lines.unshift(b.title);\n  return lines.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();\n}\n\nfunction toRows(blocks, family, opts) {\n  opts = opts || {};\n  var rows = [], i, j;\n  var emitHeadings = opts.emitHeadings !== false;\n  var isStandards = (family === 'en_standards_clause');\n\n  function ctxField(b, label) {\n    for (var k in b.ctx) if (b.ctx[k] && b.ctx[k].label === label) {\n      return (label === 'Order' ? 'Order ' : titleCase(label) + ' ') + b.ctx[k].marker;\n    }\n    return '';\n  }\n\n  function emit(b, article, contenu) {\n    if (!article) return;\n    if (opts.explodeParagraphs && b.kind === 'leaf') {\n      var parts = explodeParagraphs(String(contenu == null ? '' : contenu).split('\\n'));\n      if (!parts.length) parts = [''];\n      for (var pi = 0; pi < parts.length; pi++) push(b, article, parts[pi], pi + 1);\n      return;\n    }\n    push(b, article, contenu, 0);\n  }\n\n  function push(b, article, contenu, para) {\n    rows.push({\n      para: para,\n      article: article,\n      contenu: contenu == null ? '' : contenu,\n      label: b.label,\n      family: family,\n      zone: b.zone || 'body',\n      part: ctxField(b, 'part') || ctxField(b, 'Part'),\n      chapter: ctxField(b, 'chapter'),\n      heading: b.title || '',\n      status: b.suffix || '',\n      tags: Object.keys(b.tags || {}).join(',')\n    });\n  }\n\n  if (isStandards && opts.standardsRollup !== false) {\n    var groups = rollupStandards(blocks);\n    for (i = 0; i < groups.length; i++) {\n      var g = groups[i];\n      if (g.solo) {\n        var b0 = g.solo;\n        if (b0.preamble) { if (opts.keepPreamble) emit(b0, 'Preamble', blockText(b0, opts)); continue; }\n        if (b0.kind === 'container' && !emitHeadings) continue;\n        emit(b0, articleLabel(b0, family, opts),\n             b0.kind === 'container' ? (b0.title || blockText(b0, opts))\n                                     : (blockText(b0, opts) || b0.title));\n        continue;\n      }\n      var head = g.head, buf = [];\n      for (j = 0; j < g.members.length; j++) {\n        var mb = g.members[j];\n        var t = blockText(mb, opts);\n        var lead = (mb === head) ? (mb.title || '') : ((mb.marker + ' ' + (mb.title || '')).trim());\n        var chunk = [lead, t].filter(Boolean).join('\\n');\n        if (chunk) buf.push(chunk);\n      }\n      emit(head, articleLabel(head, family, opts), buf.join('\\n').trim());\n    }\n    return rows;\n  }\n\n  for (i = 0; i < blocks.length; i++) {\n    var b = blocks[i];\n    if (b.preamble) { if (opts.keepPreamble) emit(b, 'Preamble', blockText(b, opts)); continue; }\n\n    if (b.kind === 'container') {\n      /* mirrors the Chinese \"第一章 总则\" split: marker -> article, title -> contenu */\n      if (emitHeadings) emit(b, articleLabel(b, family, opts), b.title || blockText(b, opts));\n      continue;\n    }\n\n    var text = blockText(b, opts);\n    if (opts.includeHeadingInContenu !== true && b.title && b.lines.length === 0) text = b.title;\n    emit(b, articleLabel(b, family, opts), text);\n  }\n  return rows;\n}\n\n/* ============ DRIVER ============ */\n\n/* ======================= KNOBS ======================= */\nconst CFG = {\n  /* stage 1 — clean */\n  dewrap: false,          // true only for hard-wrapped pdftotext input; Mistral reflows\n  stripMarkdown: true,\n  skipTOC: true,          // drop \"ARRANGEMENT OF SECTIONS/REGULATIONS\" front matter\n  dropRepeated: true,     // drop running headers/footers by frequency\n  minRepeat: 4,\n\n  /* stage 2 — detect */\n  forceClass:    null,    // primary|constitution|subsidiary|regulatory|court_rules|judgment|standard\n  forceDialect:  null,    // UK|IE|AU|HK|IN|NG|ZA|AE\n  forceFamily:   null,\n  forceLeafUnit: null,    // Regulation|Rule|Article — else read from the instrument title\n  skipFrontMatter: true,\n\n  /* stage 3 — render */\n  explodeParagraphs: true,   // one row per enumerated item / prose paragraph\n  articleStyle: 'source',    // 'source'   -> \"1 Citation, commencement and revocation\"\n                             // 'labelled' -> \"Regulation 1\"\n  emitHeadings: true,        // Part/Chapter/Schedule rows\n  standardsRollup: true,     // ISO clause roll-up: article level = max(1, deepest-1)\n  keepPreamble: false,\n  scheduleLeaf: 'paragraph',\n  includeHeadingInContenu: false,\n  dropEmpty: true\n};\n/* ==================================================== */\n\nfunction upstreamFileName(i) {\n  try { return $('0 · Prepare file (base64)').all()[i].json.fileName || ''; }\n  catch (e) { return ''; }\n}\n\nconst out = [];\nconst items = $input.all();\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n\n  /* ---- stage 1 : clean ---- */\n  const raw  = recordsFromText(item.json);\n  const text = cleanText(raw, CFG);\n\n  /* ---- stage 2 : detect class, dialect, leaf unit, then split blocks ---- */\n  const cls = CFG.forceClass   ? { doc_class: CFG.forceClass, scores: {} } : classifyDoc(text);\n  const dia = CFG.forceDialect ? { dialect: CFG.forceDialect, scores: {} } : classifyDialect(text);\n  const family   = CFG.forceFamily   || pickFamily(cls.doc_class, dia.dialect, text);\n  const leafUnit = CFG.forceLeafUnit || detectLeafUnit(text, cls.doc_class);\n\n  const stripped = applyStrippers(text, dia.dialect, cls.doc_class);\n  const blocks   = toBlocks(stripped, family, Object.assign({}, CFG, { leafUnit: leafUnit }));\n\n  /* ---- stage 3 : render { article, contenu } ---- */\n  const rows   = toRows(blocks, family, CFG);\n  const source = item.json.fileName || item.json.source || upstreamFileName(i);\n\n  console.log('[parse] ' + (source || 'doc ' + i) +\n              '  class=' + cls.doc_class + '  dialect=' + (dia.dialect || '-') +\n              '  family=' + family + '  leaf=' + (leafUnit || 'default') +\n              '  blocks=' + blocks.length + '  rows=' + rows.length);\n\n  for (const r of rows) {\n    if (CFG.dropEmpty && !r.article) continue;\n    out.push({ json: {\n      article:   r.article,\n      contenu:   r.contenu,\n      para:      r.para,\n      heading:   r.heading,\n      label:     r.label,\n      family:    family,\n      doc_class: cls.doc_class,\n      dialect:   dia.dialect || '',\n      zone:      r.zone,\n      part:      r.part,\n      chapter:   r.chapter,\n      status:    r.status,\n      tags:      r.tags,\n      source:    source\n    }});\n  }\n}\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        80,
+        300
+      ],
+      "id": "f0000000-0000-4000-8000-000000000004",
+      "name": "1 · Parse structure (article/contenu)"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-0",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "en_westminster",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "en_westminster"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-1",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "en_commonwealth_legacy",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "en_commonwealth_legacy"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-2",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "en_sa_gazette",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "en_sa_gazette"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-3",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "en_gulf_article",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "en_gulf_article"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-4",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "en_constitution",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "en_constitution"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-5",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "en_regulatory",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "en_regulatory"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-6",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "en_order_rule",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "en_order_rule"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-7",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "en_standards_clause",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "en_standards_clause"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-8",
+                    "leftValue": "={{ $json.family }}",
+                    "rightValue": "en_judgment",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "en_judgment"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "none"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        360,
+        300
+      ],
+      "id": "f0000000-0000-4000-8000-000000000005",
+      "name": "Route by family"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "PASTE_YOUR_SPREADSHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "en_westminster",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "article": "={{ $json.article }}",
+            "contenu": "={{ $json.contenu }}",
+            "para": "={{ $json.para }}",
+            "heading": "={{ $json.heading }}",
+            "label": "={{ $json.label }}",
+            "doc_class": "={{ $json.doc_class }}",
+            "dialect": "={{ $json.dialect }}",
+            "zone": "={{ $json.zone }}",
+            "part": "={{ $json.part }}",
+            "chapter": "={{ $json.chapter }}",
+            "status": "={{ $json.status }}",
+            "tags": "={{ $json.tags }}",
+            "source": "={{ $json.source }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "article",
+              "displayName": "article",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contenu",
+              "displayName": "contenu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "para",
+              "displayName": "para",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "heading",
+              "displayName": "heading",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "label",
+              "displayName": "label",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "doc_class",
+              "displayName": "doc_class",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dialect",
+              "displayName": "dialect",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "zone",
+              "displayName": "zone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part",
+              "displayName": "part",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chapter",
+              "displayName": "chapter",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tags",
+              "displayName": "tags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        620,
+        -160
+      ],
+      "id": "f0000000-0000-4000-8000-000000000010",
+      "name": "Sheet · en_westminster"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "PASTE_YOUR_SPREADSHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "en_commonwealth_legacy",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "article": "={{ $json.article }}",
+            "contenu": "={{ $json.contenu }}",
+            "para": "={{ $json.para }}",
+            "heading": "={{ $json.heading }}",
+            "label": "={{ $json.label }}",
+            "doc_class": "={{ $json.doc_class }}",
+            "dialect": "={{ $json.dialect }}",
+            "zone": "={{ $json.zone }}",
+            "part": "={{ $json.part }}",
+            "chapter": "={{ $json.chapter }}",
+            "status": "={{ $json.status }}",
+            "tags": "={{ $json.tags }}",
+            "source": "={{ $json.source }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "article",
+              "displayName": "article",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contenu",
+              "displayName": "contenu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "para",
+              "displayName": "para",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "heading",
+              "displayName": "heading",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "label",
+              "displayName": "label",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "doc_class",
+              "displayName": "doc_class",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dialect",
+              "displayName": "dialect",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "zone",
+              "displayName": "zone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part",
+              "displayName": "part",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chapter",
+              "displayName": "chapter",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tags",
+              "displayName": "tags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        620,
+        -50
+      ],
+      "id": "f0000000-0000-4000-8000-000000000011",
+      "name": "Sheet · en_commonwealth_legacy"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "PASTE_YOUR_SPREADSHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "en_sa_gazette",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "article": "={{ $json.article }}",
+            "contenu": "={{ $json.contenu }}",
+            "para": "={{ $json.para }}",
+            "heading": "={{ $json.heading }}",
+            "label": "={{ $json.label }}",
+            "doc_class": "={{ $json.doc_class }}",
+            "dialect": "={{ $json.dialect }}",
+            "zone": "={{ $json.zone }}",
+            "part": "={{ $json.part }}",
+            "chapter": "={{ $json.chapter }}",
+            "status": "={{ $json.status }}",
+            "tags": "={{ $json.tags }}",
+            "source": "={{ $json.source }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "article",
+              "displayName": "article",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contenu",
+              "displayName": "contenu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "para",
+              "displayName": "para",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "heading",
+              "displayName": "heading",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "label",
+              "displayName": "label",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "doc_class",
+              "displayName": "doc_class",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dialect",
+              "displayName": "dialect",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "zone",
+              "displayName": "zone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part",
+              "displayName": "part",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chapter",
+              "displayName": "chapter",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tags",
+              "displayName": "tags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        620,
+        60
+      ],
+      "id": "f0000000-0000-4000-8000-000000000012",
+      "name": "Sheet · en_sa_gazette"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "PASTE_YOUR_SPREADSHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "en_gulf_article",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "article": "={{ $json.article }}",
+            "contenu": "={{ $json.contenu }}",
+            "para": "={{ $json.para }}",
+            "heading": "={{ $json.heading }}",
+            "label": "={{ $json.label }}",
+            "doc_class": "={{ $json.doc_class }}",
+            "dialect": "={{ $json.dialect }}",
+            "zone": "={{ $json.zone }}",
+            "part": "={{ $json.part }}",
+            "chapter": "={{ $json.chapter }}",
+            "status": "={{ $json.status }}",
+            "tags": "={{ $json.tags }}",
+            "source": "={{ $json.source }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "article",
+              "displayName": "article",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contenu",
+              "displayName": "contenu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "para",
+              "displayName": "para",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "heading",
+              "displayName": "heading",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "label",
+              "displayName": "label",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "doc_class",
+              "displayName": "doc_class",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dialect",
+              "displayName": "dialect",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "zone",
+              "displayName": "zone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part",
+              "displayName": "part",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chapter",
+              "displayName": "chapter",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tags",
+              "displayName": "tags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        620,
+        170
+      ],
+      "id": "f0000000-0000-4000-8000-000000000013",
+      "name": "Sheet · en_gulf_article"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "PASTE_YOUR_SPREADSHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "en_constitution",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "article": "={{ $json.article }}",
+            "contenu": "={{ $json.contenu }}",
+            "para": "={{ $json.para }}",
+            "heading": "={{ $json.heading }}",
+            "label": "={{ $json.label }}",
+            "doc_class": "={{ $json.doc_class }}",
+            "dialect": "={{ $json.dialect }}",
+            "zone": "={{ $json.zone }}",
+            "part": "={{ $json.part }}",
+            "chapter": "={{ $json.chapter }}",
+            "status": "={{ $json.status }}",
+            "tags": "={{ $json.tags }}",
+            "source": "={{ $json.source }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "article",
+              "displayName": "article",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contenu",
+              "displayName": "contenu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "para",
+              "displayName": "para",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "heading",
+              "displayName": "heading",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "label",
+              "displayName": "label",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "doc_class",
+              "displayName": "doc_class",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dialect",
+              "displayName": "dialect",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "zone",
+              "displayName": "zone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part",
+              "displayName": "part",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chapter",
+              "displayName": "chapter",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tags",
+              "displayName": "tags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        620,
+        280
+      ],
+      "id": "f0000000-0000-4000-8000-000000000014",
+      "name": "Sheet · en_constitution"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "PASTE_YOUR_SPREADSHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "en_regulatory",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "article": "={{ $json.article }}",
+            "contenu": "={{ $json.contenu }}",
+            "para": "={{ $json.para }}",
+            "heading": "={{ $json.heading }}",
+            "label": "={{ $json.label }}",
+            "doc_class": "={{ $json.doc_class }}",
+            "dialect": "={{ $json.dialect }}",
+            "zone": "={{ $json.zone }}",
+            "part": "={{ $json.part }}",
+            "chapter": "={{ $json.chapter }}",
+            "status": "={{ $json.status }}",
+            "tags": "={{ $json.tags }}",
+            "source": "={{ $json.source }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "article",
+              "displayName": "article",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contenu",
+              "displayName": "contenu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "para",
+              "displayName": "para",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "heading",
+              "displayName": "heading",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "label",
+              "displayName": "label",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "doc_class",
+              "displayName": "doc_class",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dialect",
+              "displayName": "dialect",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "zone",
+              "displayName": "zone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part",
+              "displayName": "part",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chapter",
+              "displayName": "chapter",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tags",
+              "displayName": "tags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        620,
+        390
+      ],
+      "id": "f0000000-0000-4000-8000-000000000015",
+      "name": "Sheet · en_regulatory"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "PASTE_YOUR_SPREADSHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "en_order_rule",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "article": "={{ $json.article }}",
+            "contenu": "={{ $json.contenu }}",
+            "para": "={{ $json.para }}",
+            "heading": "={{ $json.heading }}",
+            "label": "={{ $json.label }}",
+            "doc_class": "={{ $json.doc_class }}",
+            "dialect": "={{ $json.dialect }}",
+            "zone": "={{ $json.zone }}",
+            "part": "={{ $json.part }}",
+            "chapter": "={{ $json.chapter }}",
+            "status": "={{ $json.status }}",
+            "tags": "={{ $json.tags }}",
+            "source": "={{ $json.source }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "article",
+              "displayName": "article",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contenu",
+              "displayName": "contenu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "para",
+              "displayName": "para",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "heading",
+              "displayName": "heading",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "label",
+              "displayName": "label",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "doc_class",
+              "displayName": "doc_class",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dialect",
+              "displayName": "dialect",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "zone",
+              "displayName": "zone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part",
+              "displayName": "part",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chapter",
+              "displayName": "chapter",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tags",
+              "displayName": "tags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        620,
+        500
+      ],
+      "id": "f0000000-0000-4000-8000-000000000016",
+      "name": "Sheet · en_order_rule"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "PASTE_YOUR_SPREADSHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "en_standards_clause",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "article": "={{ $json.article }}",
+            "contenu": "={{ $json.contenu }}",
+            "para": "={{ $json.para }}",
+            "heading": "={{ $json.heading }}",
+            "label": "={{ $json.label }}",
+            "doc_class": "={{ $json.doc_class }}",
+            "dialect": "={{ $json.dialect }}",
+            "zone": "={{ $json.zone }}",
+            "part": "={{ $json.part }}",
+            "chapter": "={{ $json.chapter }}",
+            "status": "={{ $json.status }}",
+            "tags": "={{ $json.tags }}",
+            "source": "={{ $json.source }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "article",
+              "displayName": "article",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contenu",
+              "displayName": "contenu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "para",
+              "displayName": "para",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "heading",
+              "displayName": "heading",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "label",
+              "displayName": "label",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "doc_class",
+              "displayName": "doc_class",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dialect",
+              "displayName": "dialect",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "zone",
+              "displayName": "zone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part",
+              "displayName": "part",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chapter",
+              "displayName": "chapter",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tags",
+              "displayName": "tags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        620,
+        610
+      ],
+      "id": "f0000000-0000-4000-8000-000000000017",
+      "name": "Sheet · en_standards_clause"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "PASTE_YOUR_SPREADSHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "en_judgment",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "article": "={{ $json.article }}",
+            "contenu": "={{ $json.contenu }}",
+            "para": "={{ $json.para }}",
+            "heading": "={{ $json.heading }}",
+            "label": "={{ $json.label }}",
+            "doc_class": "={{ $json.doc_class }}",
+            "dialect": "={{ $json.dialect }}",
+            "zone": "={{ $json.zone }}",
+            "part": "={{ $json.part }}",
+            "chapter": "={{ $json.chapter }}",
+            "status": "={{ $json.status }}",
+            "tags": "={{ $json.tags }}",
+            "source": "={{ $json.source }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "article",
+              "displayName": "article",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contenu",
+              "displayName": "contenu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "para",
+              "displayName": "para",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "heading",
+              "displayName": "heading",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "label",
+              "displayName": "label",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "doc_class",
+              "displayName": "doc_class",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dialect",
+              "displayName": "dialect",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "zone",
+              "displayName": "zone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part",
+              "displayName": "part",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "chapter",
+              "displayName": "chapter",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tags",
+              "displayName": "tags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        620,
+        720
+      ],
+      "id": "f0000000-0000-4000-8000-000000000018",
+      "name": "Sheet · en_judgment"
+    }
+  ],
+  "connections": {
+    "Route by family": {
+      "main": [
+        [
+          {
+            "node": "Sheet · en_westminster",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheet · en_commonwealth_legacy",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheet · en_sa_gazette",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheet · en_gulf_article",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheet · en_constitution",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheet · en_regulatory",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheet · en_order_rule",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheet · en_standards_clause",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheet · en_judgment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload document": {
+      "main": [
+        [
+          {
+            "node": "0 · Prepare file (base64)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "0 · Prepare file (base64)": {
+      "main": [
+        [
+          {
+            "node": "Mistral OCR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mistral OCR": {
+      "main": [
+        [
+          {
+            "node": "1 · Parse structure (article/contenu)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1 · Parse structure (article/contenu)": {
+      "main": [
+        [
+          {
+            "node": "Route by family",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "en-legal-parser"
+  }
+}
